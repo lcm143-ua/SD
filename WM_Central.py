@@ -23,39 +23,40 @@ def handle_client(conn, addr):
     id_estacion_actual = None
     connected = True
     while connected:
-        msg_length = conn.recv(HEADER).decode(FORMAT)
-        if msg_length:
-            msg_length = int(msg_length)
-            msg = conn.recv(msg_length).decode(FORMAT)
-            if msg == FIN:
+            msg_length = conn.recv(HEADER).decode(FORMAT)
+            if not msg_length:
                 connected = False
             else:
-
-                partes = msg.split('#')
-                comando = partes[0]
-
-                if comando == "REGISTER" and len(partes) >= 3:
-                    id_estacion = partes[1]
-                    ubicacion = partes[2]
-                    id_estacion_actual = id_estacion
-
-                    estaciones[id_estacion] = {
-                        "id": id_estacion,
-                        "ubicacion": ubicacion,
-                        "estado": "AVAILABLE",
-                        "addr": addr,
-                        "conn": conn
-                    }
-                    print(f"\n[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada con éxito desde {addr}")
-                    print(f"[ESTACIONES REGISTRADAS EN MEMORIA]: {list(estaciones.keys())}\n")
-
-                    respuesta = f"ACK#REGISTER_OK#{id_estacion}"
-                    send_msg(conn, respuesta)
-
+                msg_length = int(msg_length)
+                msg = conn.recv(msg_length).decode(FORMAT)
+                if msg == FIN:
+                    connected = False
                 else:
-                    print(f"[CENTRAL] Recibido de [{id_estacion_actual or addr}]: {msg}")
-                    respuesta = f"ACK#OK#Recibido: {msg}"
-                    send_msg(conn, respuesta)
+                    partes = msg.split('#')
+                    comando = partes[0]
+    
+                    if comando == "REGISTER" and len(partes) >= 3:
+                        id_estacion = partes[1]
+                        ubicacion = partes[2]
+                        id_estacion_actual = id_estacion
+    
+                        estaciones[id_estacion] = {
+                            "id": id_estacion,
+                            "ubicacion": ubicacion,
+                            "estado": "AVAILABLE",
+                            "addr": addr,
+                            "conn": conn
+                        }
+                        print(f"\n[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada con éxito desde {addr}")
+                        print(f"[ESTACIONES REGISTRADAS EN MEMORIA]: {list(estaciones.keys())}\n")
+    
+                        respuesta = f"ACK#REGISTER_OK#{id_estacion}"
+                        send_msg(conn, respuesta)
+    
+                    else:
+                        print(f"[CENTRAL] Recibido de [{id_estacion_actual or addr}]: {msg}")
+                        respuesta = f"ACK#OK#Recibido: {msg}"
+                        send_msg(conn, respuesta)
 
     print(f"[DESCONEXION] Cierre de socket {addr}")
     if id_estacion_actual and id_estacion_actual in estaciones:
