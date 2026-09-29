@@ -54,8 +54,9 @@ if  (len(sys.argv) >= 5):
                 resp = receive(client)
                 print(f"[RESPUESTA CENTRAL]: {resp}\n")
 
-        print("[DESCONEXION] Enviando cierre a WM_Central...")
-        client.close()
+    print("[DESCONEXION] Enviando cierre a WM_Central...")
+    client.close()
 
 else:
-    print("Uso correcto: python WM_WS_M.py 127.0.0.1 9999 WS_01#Parque_Central")
+    print("Uso correcto: python WM_WS_M.py <puerto_engine> <ip_central> <puerto_central> <id_ws> <ubicacion>")
+    print("Ejemplo: python WM_WS_M.py 127.0.0.1 9999 WS_01#Parque_Central")
