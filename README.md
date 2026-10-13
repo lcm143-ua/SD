@@ -1,3 +1,3 @@
-# SD
-Laura Caturla Martín
-Borja Lara Zarco
+# SD - Alumnos 
+### Laura Caturla Martín 
+### Borja Lara Zarco
