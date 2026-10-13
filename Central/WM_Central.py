@@ -2,6 +2,8 @@ import socket
 import threading
 import sys
 import sqlite3
+import queue
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -30,6 +32,18 @@ COLOR_ESTADO = {
     "OFFLINE": "#9e9e9e"        # gris
 }
 
+# Operario con el que la central lanza sus propios riegos (punto 11)
+OPERARIO_CENTRAL = "CENTRAL"
+TODAS = "TODAS"
+
+# Operarios dados de alta al crear la BD (los FO arrancan con uno de estos ID)
+OPERARIOS_INICIALES = [
+    (OPERARIO_CENTRAL, "Central de control"),
+    ("FO_01", "Operario 1"),
+    ("FO_02", "Operario 2"),
+    ("FO_03", "Operario 3")
+]
+
 conexion = sqlite3.connect("database.db")
 cursor = conexion.cursor()
 
@@ -40,18 +54,53 @@ cursor.execute("""
         Location TEXT NOT NULL,
         Status TEXT NOT NULL,
         Flow REAL,
-        Accum INTERGER,
+        Accum INTEGER,
         Operator TEXT
     )
 """)
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS operarios(
+        ID TEXT PRIMARY KEY,
+        Nombre TEXT NOT NULL
+    )
+""")
+
+# Un registro por cada riego: sirve para el resumen final que se envía al operario
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS riegos(
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Estacion TEXT NOT NULL,
+        Operario TEXT NOT NULL,
+        Inicio TEXT NOT NULL,
+        Limite INTEGER NOT NULL,
+        Fin TEXT,
+        Volumen REAL,
+        Duracion INTEGER,
+        Motivo TEXT
+    )
+""")
+
+cursor.executemany("INSERT OR IGNORE INTO operarios (ID, Nombre) VALUES (?, ?)", OPERARIOS_INICIALES)
 
 #Guardar
 conexion.commit()
 
 # Diccionario en memoria con todas las estaciones. Lo usan varios hilos a la vez
-# (uno por cada monitor conectado), así que se protege con un lock.
+# (uno por cada monitor conectado y el del panel), así que se protege con un lock.
 estaciones = {}
 lock_estaciones = threading.Lock()
+
+# Mensajes para el registro de eventos del panel. Los hilos de los sockets no pueden
+# tocar la ventana de Tkinter, así que dejan los mensajes en esta cola y el panel los recoge.
+cola_log = queue.Queue()
+
+def log(mensaje):
+    print(mensaje)
+    cola_log.put(f"{time.strftime('%H:%M:%S')}  {mensaje}")
+
+def ahora():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 def cargar_estaciones_bd():
     # Al arrancar no sabemos el estado real de ninguna estación hasta que se
@@ -63,6 +112,13 @@ def cargar_estaciones_bd():
         UPDATE estaciones
         SET Status = 'OFFLINE', Flow = NULL, Accum = NULL, Operator = NULL
     """)
+
+    # Los riegos que quedaron abiertos cuando se apagó la central se cierran
+    cursor.execute("""
+        UPDATE riegos
+        SET Fin = ?, Motivo = 'REINICIO_CENTRAL'
+        WHERE Fin IS NULL
+    """, (ahora(),))
     conexion.commit()
 
     cursor.execute("SELECT ID, Location FROM estaciones")
@@ -71,6 +127,7 @@ def cargar_estaciones_bd():
             "id": id_estacion,
             "ubicacion": ubicacion,
             "estado": "OFFLINE",
+            "bloqueada": False,
             "addr": None,
             "conn": None
         }
@@ -130,6 +187,194 @@ def modificar_estado(id, estado):
     conexion.commit()
     conexion.close()
 
+########## OPERARIOS Y RIEGOS (BD) ##########
+
+def operario_existe(id_operario):
+    conexion = sqlite3.connect("database.db")
+    cursor = conexion.cursor()
+    cursor.execute("SELECT ID FROM operarios WHERE ID = ?", (id_operario,))
+    existe = cursor.fetchone() is not None
+    conexion.close()
+    return existe
+
+def iniciar_riego_bd(id_estacion, id_operario, limite):
+    # Se llama cuando el engine confirma que ha abierto la electroválvula (RIEGO_INICIO)
+    conexion = sqlite3.connect("database.db")
+    cursor = conexion.cursor()
+    cursor.execute("""
+        INSERT INTO riegos (Estacion, Operario, Inicio, Limite)
+        VALUES (?, ?, ?, ?)
+    """, (id_estacion, id_operario, ahora(), limite))
+    cursor.execute("""
+        UPDATE estaciones
+        SET Status = 'WATERING', Flow = 0, Accum = 0, Operator = ?
+        WHERE ID = ?
+    """, (id_operario, id_estacion))
+    conexion.commit()
+    conexion.close()
+
+def actualizar_telemetria_bd(id_estacion, caudal, volumen):
+    # Se llama cada segundo durante el riego (TELEMETRIA)
+    conexion = sqlite3.connect("database.db")
+    cursor = conexion.cursor()
+    cursor.execute("""
+        UPDATE estaciones
+        SET Flow = ?, Accum = ?
+        WHERE ID = ?
+    """, (caudal, volumen, id_estacion))
+    conexion.commit()
+    conexion.close()
+
+def finalizar_riego_bd(id_estacion, volumen, duracion, motivo):
+    # Cierra el riego abierto de la estación y devuelve su resumen (o None si no había)
+    conexion = sqlite3.connect("database.db")
+    cursor = conexion.cursor()
+    cursor.execute("""
+        SELECT ID, Operario, Inicio, Limite FROM riegos
+        WHERE Estacion = ? AND Fin IS NULL
+        ORDER BY ID DESC
+    """, (id_estacion,))
+    fila = cursor.fetchone()
+
+    resumen = None
+    if fila is not None:
+        id_riego, id_operario, inicio, limite = fila
+        cursor.execute("""
+            UPDATE riegos
+            SET Fin = ?, Volumen = ?, Duracion = ?, Motivo = ?
+            WHERE ID = ?
+        """, (ahora(), volumen, duracion, motivo, id_riego))
+        resumen = {
+            "riego": id_riego,
+            "estacion": id_estacion,
+            "operario": id_operario,
+            "inicio": inicio,
+            "limite": limite,
+            "volumen": volumen,
+            "duracion": duracion,
+            "motivo": motivo
+        }
+
+    cursor.execute("""
+        UPDATE estaciones
+        SET Flow = NULL, Accum = NULL, Operator = NULL
+        WHERE ID = ?
+    """, (id_estacion,))
+    conexion.commit()
+    conexion.close()
+    return resumen
+
+########## EVENTOS DE RIEGO QUE ENVIARÁ EL ENGINE (por Kafka) ##########
+# Estas funciones las llamará el consumidor de Kafka al recibir los mensajes
+# RIEGO_INICIO, TELEMETRIA y RIEGO_FIN que ya publica (de momento en vacío) WM_WS_E.
+
+def riego_iniciado(id_estacion, id_operario, limite):
+    with lock_estaciones:
+        estaciones[id_estacion]["estado"] = "WATERING"
+        iniciar_riego_bd(id_estacion, id_operario, limite)
+    log(f"[RIEGO] '{id_estacion}' empieza a regar. Operario: {id_operario}, límite {limite} s")
+
+def telemetria_recibida(id_estacion, caudal, volumen):
+    actualizar_telemetria_bd(id_estacion, caudal, volumen)
+
+def riego_finalizado(id_estacion, volumen, duracion, motivo):
+    with lock_estaciones:
+        estacion = estaciones[id_estacion]
+        resumen = finalizar_riego_bd(id_estacion, volumen, duracion, motivo)
+        # Vuelve a reposo salvo que la haya cambiado otro evento (fuga, bloqueo, desconexión)
+        if estacion["estado"] == "WATERING":
+            estacion["estado"] = "STOPPED" if estacion["bloqueada"] else "AVAILABLE"
+            modificar_estado(id_estacion, estacion["estado"])
+    log(f"[RIEGO] '{id_estacion}' termina ({motivo}): {volumen} l en {duracion} s")
+    # PENDIENTE KAFKA: enviar el resumen al operario que pidió el riego
+    return resumen
+
+########## ÓRDENES DE LA CENTRAL (punto 11) ##########
+
+def enviar_orden(id_estacion, orden):
+    # PENDIENTE KAFKA: aquí se publicará la orden para el WM_WS_E de esa estación.
+    # Formatos ya definidos:
+    #   REGAR#id_ws#operario#limite_segundos
+    #   BLOQUEAR#id_ws
+    #   ACTIVAR#id_ws
+    log(f"[ORDEN -> {id_estacion}] {orden}  (envío por Kafka pendiente)")
+
+def autorizar_riego(id_estacion, id_operario):
+    # Comprobaciones antes de autorizar un riego (punto 4 de la mecánica).
+    # Devuelve (True, "") o (False, motivo). La usarán también las peticiones de los FO.
+    if not operario_existe(id_operario):
+        return False, f"el operario '{id_operario}' no está dado de alta"
+
+    with lock_estaciones:
+        if id_estacion not in estaciones:
+            return False, f"la estación '{id_estacion}' no existe"
+
+        estado = estaciones[id_estacion]["estado"]
+        if estado == "OFFLINE":
+            return False, "la estación está desconectada"
+        if estado == "LEAK":
+            return False, "la estación tiene una fuga"
+        if estado == "STOPPED" or estaciones[id_estacion]["bloqueada"]:
+            return False, "la estación está fuera de servicio"
+        if estado == "WATERING":
+            return False, "la estación ya está regando"
+
+    return True, ""
+
+def orden_iniciar_riego(id_estacion, limite, id_operario=OPERARIO_CENTRAL):
+    ok, motivo = autorizar_riego(id_estacion, id_operario)
+    if ok:
+        log(f"[RIEGO] Autorizado en '{id_estacion}' para {id_operario} ({limite} s)")
+        enviar_orden(id_estacion, f"REGAR#{id_estacion}#{id_operario}#{limite}")
+    else:
+        log(f"[RIEGO] Denegado en '{id_estacion}': {motivo}")
+    return ok
+
+def orden_bloquear(id_estacion):
+    # La WS termina cualquier riego y pasa a Fuera de Servicio (naranja)
+    with lock_estaciones:
+        estacion = estaciones[id_estacion]
+        if estacion["estado"] == "OFFLINE":
+            log(f"[BLOQUEO] '{id_estacion}' está desconectada, no se puede bloquear")
+            return False
+        estacion["bloqueada"] = True
+        # Con fuga sigue en rojo: la avería se muestra antes que el bloqueo
+        if estacion["estado"] in ("AVAILABLE", "WATERING"):
+            estacion["estado"] = "STOPPED"
+            modificar_estado(id_estacion, "STOPPED")
+    log(f"[BLOQUEO] '{id_estacion}' bloqueada (Fuera de Servicio)")
+    enviar_orden(id_estacion, f"BLOQUEAR#{id_estacion}")
+    return True
+
+def orden_activar(id_estacion):
+    # La WS vuelve a estar ACTIVADA (verde)
+    with lock_estaciones:
+        estacion = estaciones[id_estacion]
+        if estacion["estado"] == "OFFLINE":
+            log(f"[ACTIVAR] '{id_estacion}' está desconectada, no se puede activar")
+            return False
+        estacion["bloqueada"] = False
+        if estacion["estado"] == "STOPPED":
+            estacion["estado"] = "AVAILABLE"
+            modificar_estado(id_estacion, "AVAILABLE")
+    log(f"[ACTIVAR] '{id_estacion}' activada")
+    enviar_orden(id_estacion, f"ACTIVAR#{id_estacion}")
+    return True
+
+def aplicar_orden(id_estacion, funcion, *args):
+    # Ejecuta la orden sobre una estación o sobre todas las conectadas
+    if id_estacion == TODAS:
+        with lock_estaciones:
+            destino = [id for id, e in estaciones.items() if e["estado"] != "OFFLINE"]
+        if not destino:
+            log("[ORDEN] No hay ninguna estación conectada")
+        for id in destino:
+            funcion(id, *args)
+    else:
+        funcion(id_estacion, *args)
+
+########## SOCKETS ##########
+
 def registrar_estacion(id_estacion, ubicacion, conn, addr):
     # Autenticación: se rechaza un ID que ya tiene un monitor conectado.
     # Comprobar y dar de alta va dentro del lock para que dos monitores con el
@@ -138,22 +383,46 @@ def registrar_estacion(id_estacion, ubicacion, conn, addr):
         if id_estacion in estaciones and estaciones[id_estacion]["conn"] is not None:
             return False
 
+        # Si la central la había bloqueado, sigue bloqueada al reconectarse
+        bloqueada = id_estacion in estaciones and estaciones[id_estacion]["bloqueada"]
         estaciones[id_estacion] = {
             "id": id_estacion,
             "ubicacion": ubicacion,
-            "estado": "AVAILABLE",
+            "estado": "STOPPED" if bloqueada else "AVAILABLE",
+            "bloqueada": bloqueada,
             "addr": addr,
             "conn": conn
         }
         guardar_estacion_bd(estaciones, id_estacion)
     return True
 
+def cambiar_estado_monitor(id_estacion, nuevo_estado):
+    # Aplica un ESTADO enviado por el monitor. Devuelve el estado con que queda.
+    with lock_estaciones:
+        estacion = estaciones[id_estacion]
+        # Al resolverse una fuga, una estación bloqueada vuelve a Fuera de Servicio
+        if nuevo_estado == "AVAILABLE" and estacion["bloqueada"]:
+            nuevo_estado = "STOPPED"
+        estado_anterior = estacion["estado"]
+        estacion["estado"] = nuevo_estado
+        modificar_estado(id_estacion, nuevo_estado)
+
+    if estado_anterior == "WATERING" and nuevo_estado == "LEAK":
+        log(f"[AVERÍA] Fuga en '{id_estacion}' durante un riego: el engine lo corta")
+    return nuevo_estado
+
 def desconectar_estacion(id_estacion):
     with lock_estaciones:
-        estaciones[id_estacion]["estado"] = "OFFLINE"
-        estaciones[id_estacion]["conn"] = None
-        estaciones[id_estacion]["addr"] = None
+        estacion = estaciones[id_estacion]
+        estado_anterior = estacion["estado"]
+        estacion["estado"] = "OFFLINE"
+        estacion["conn"] = None
+        estacion["addr"] = None
         modificar_estado(id_estacion, "OFFLINE")
+
+    # Si estaba regando, el riego queda cerrado: ya no se puede monitorizar
+    if estado_anterior == "WATERING":
+        finalizar_riego_bd(id_estacion, None, None, "DESCONEXION")
 
 def send_msg(conn, msg):
     message = msg.encode(FORMAT)
@@ -208,11 +477,11 @@ def handle_client(conn, addr):
 
                     if registrar_estacion(id_estacion, ubicacion, conn, addr):
                         id_estacion_actual = id_estacion
-                        print(f"\n[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada con éxito desde {addr}")
+                        log(f"[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada desde {addr}")
                         send_msg(conn, f"ACK#REGISTER_OK#{id_estacion}")
                         mostrar_bd()
                     else:
-                        print(f"\n[REGISTRO KO] '{id_estacion}' ya está conectada, se rechaza {addr}")
+                        log(f"[REGISTRO KO] '{id_estacion}' ya está conectada, se rechaza {addr}")
                         send_msg(conn, f"NACK#REGISTER_KO#{id_estacion}#ID ya conectado")
                         connected = False
 
@@ -222,11 +491,9 @@ def handle_client(conn, addr):
 
                     # Un monitor solo puede cambiar el estado de su propia estación
                     if id_estacion == id_estacion_actual and nuevo_estado in ESTADOS_WS:
-                        with lock_estaciones:
-                            estaciones[id_estacion]["estado"] = nuevo_estado
-                            modificar_estado(id_estacion, nuevo_estado)
-                        print(f"[ESTADO] Estación '{id_estacion}' -> {nuevo_estado}")
-                        send_msg(conn, f"ACK#ESTADO_OK#{id_estacion}#{nuevo_estado}")
+                        estado_final = cambiar_estado_monitor(id_estacion, nuevo_estado)
+                        log(f"[ESTADO] Estación '{id_estacion}' -> {estado_final}")
+                        send_msg(conn, f"ACK#ESTADO_OK#{id_estacion}#{estado_final}")
                         mostrar_bd()
                     else:
                         print(f"[ESTADO] Mensaje de estado no válido: {msg}")
@@ -240,7 +507,7 @@ def handle_client(conn, addr):
     # Tanto si llega FIN como si se corta la conexión, la estación queda desconectada
     if id_estacion_actual is not None:
         desconectar_estacion(id_estacion_actual)
-        print(f"[DESCONEXION] Estación '{id_estacion_actual}' marcada como OFFLINE")
+        log(f"[DESCONEXION] Estación '{id_estacion_actual}' marcada como OFFLINE")
         mostrar_bd()
 
     conn.close()
@@ -256,46 +523,92 @@ def start(server, ip, port):
         thread.start()
         print(f"[CONEXIONES ACTIVAS] {threading.active_count() - 2}")
 
+########## PANEL ##########
+
 def Pantalla_Monitor():
     ventana = tk.Tk()
     ventana.title("WM_Central - Monitor de Estaciones de Riego")
-    ventana.geometry("1100x600")
+    ventana.geometry("1280x720")
 
     # El tema por defecto de Windows ignora el color de fondo de las filas; "clam" sí lo respeta
     estilo = ttk.Style()
     estilo.theme_use("clam")
 
-    # 1. Frame Izquierdo: Tabla de Datos
+    # 1. Frame Izquierdo: Tabla de Datos, órdenes y registro de eventos
     frame_izq = tk.Frame(ventana)
     frame_izq.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     lbl_tabla = tk.Label(frame_izq, text="Estado de las Estaciones", font=("Arial", 14, "bold"))
     lbl_tabla.pack(pady=5)
 
-    columnas = ("ID", "Location", "Status", "Flow", "Accum", "Operator")
-    tabla = ttk.Treeview(frame_izq, columns=columnas, show="headings")
+    frame_tabla = tk.Frame(frame_izq)
+    frame_tabla.pack(fill=tk.BOTH, expand=True)
 
+    columnas = ("ID", "Location", "Status", "Flow", "Accum", "Operator")
+    tabla = ttk.Treeview(frame_tabla, columns=columnas, show="headings", height=8)
+
+    anchos = {"ID": 70, "Location": 150, "Status": 125, "Flow": 95, "Accum": 80, "Operator": 85}
     for col in columnas:
         tabla.heading(col, text=col)
-        tabla.column(col, width=90, anchor=tk.CENTER)
+        tabla.column(col, width=anchos[col], anchor=tk.CENTER)
 
     # Una etiqueta (tag) por estado con su color de fondo
     for estado, color in COLOR_ESTADO.items():
         tabla.tag_configure(estado, background=color)
 
-    scrollbar = ttk.Scrollbar(frame_izq, orient=tk.VERTICAL, command=tabla.yview)
+    scrollbar = ttk.Scrollbar(frame_tabla, orient=tk.VERTICAL, command=tabla.yview)
     tabla.configure(yscroll=scrollbar.set)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
     tabla.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    # Órdenes de la central sobre una o todas las estaciones (punto 11)
+    frame_ordenes = tk.LabelFrame(frame_izq, text="Órdenes de la central", font=("Arial", 10, "bold"))
+    frame_ordenes.pack(fill=tk.X, pady=8)
+
+    tk.Label(frame_ordenes, text="Estación:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+    combo_estacion = ttk.Combobox(frame_ordenes, values=[TODAS], state="readonly", width=12)
+    combo_estacion.set(TODAS)
+    combo_estacion.grid(row=0, column=1, padx=5, pady=5)
+
+    tk.Label(frame_ordenes, text="Duración (s):").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+    spin_duracion = tk.Spinbox(frame_ordenes, from_=5, to=3600, increment=5, width=6)
+    spin_duracion.delete(0, tk.END)
+    spin_duracion.insert(0, "30")
+    spin_duracion.grid(row=0, column=3, padx=5, pady=5)
+
+    def pulsar_regar():
+        duracion = spin_duracion.get().strip()
+        if not duracion.isdigit() or int(duracion) <= 0:
+            log("[RIEGO] La duración debe ser un número de segundos mayor que 0")
+        else:
+            aplicar_orden(combo_estacion.get(), orden_iniciar_riego, int(duracion))
+
+    tk.Button(frame_ordenes, text="Iniciar riego", bg="#c8e6c9", width=12,
+              command=pulsar_regar).grid(row=0, column=4, padx=5, pady=5)
+    tk.Button(frame_ordenes, text="Bloquear", bg="#ffe0b2", width=12,
+              command=lambda: aplicar_orden(combo_estacion.get(), orden_bloquear)).grid(row=0, column=5, padx=5, pady=5)
+    tk.Button(frame_ordenes, text="Activar", bg="#c8e6c9", width=12,
+              command=lambda: aplicar_orden(combo_estacion.get(), orden_activar)).grid(row=0, column=6, padx=5, pady=5)
+
+    # Al pinchar una fila se selecciona esa estación en el desplegable. Después se
+    # quita la selección para que el color de selección no tape el color del estado.
+    def seleccionar_fila(evento):
+        seleccion = tabla.selection()
+        if seleccion:
+            combo_estacion.set(seleccion[0])
+            tabla.selection_remove(seleccion)
+    tabla.bind("<<TreeviewSelect>>", seleccionar_fila)
+
+    # Registro de eventos: mensajes de autorización, denegación, órdenes, estados...
+    tk.Label(frame_izq, text="Registro de eventos", font=("Arial", 10, "bold")).pack(anchor="w")
+    texto_log = tk.Text(frame_izq, height=10, state=tk.DISABLED, font=("Consolas", 9), bg="#1e2329", fg="#d8dee9")
+    texto_log.pack(fill=tk.BOTH, expand=True)
 
     # Alterna en cada refresco para que las estaciones regando parpadeen
     parpadeo = {"encendido": True}
 
     # Función interna para refrescar los datos automáticamente
     def cargar_datos_bd():
-        for fila in tabla.get_children():
-            tabla.delete(fila)
-
         parpadeo["encendido"] = not parpadeo["encendido"]
 
         try:
@@ -303,19 +616,39 @@ def Pantalla_Monitor():
             cur = conn.cursor()
             cur.execute("SELECT ID, Location, Status, Flow, Accum, Operator FROM estaciones")
             filas = cur.fetchall()
+            conn.close()
+
+            # Las filas se actualizan en su sitio (iid = ID) para no perder la selección
             for fila in filas:
                 estado = fila[2]
                 fila_limpia = [valor if valor is not None else "-" for valor in fila]
                 fila_limpia[2] = TEXTO_ESTADO.get(estado, estado)
+                if fila[3] is not None:
+                    fila_limpia[3] = f"{fila[3]:.2f} l/min"
+                if fila[4] is not None:
+                    fila_limpia[4] = f"{fila[4]:.2f} l"
 
                 tag = estado
                 if estado == "WATERING" and not parpadeo["encendido"]:
                     tag = "WATERING_OFF"
 
-                tabla.insert("", tk.END, values=fila_limpia, tags=(tag,))
-            conn.close()
+                if tabla.exists(fila[0]):
+                    tabla.item(fila[0], values=fila_limpia, tags=(tag,))
+                else:
+                    tabla.insert("", tk.END, iid=fila[0], values=fila_limpia, tags=(tag,))
+
+            ids = [TODAS] + [fila[0] for fila in filas]
+            if list(combo_estacion["values"]) != ids:
+                combo_estacion["values"] = ids
         except Exception as e:
             print(f"[ERROR BD] No se pudieron refrescar los datos: {e}")
+
+        # Mensajes nuevos del registro de eventos
+        while not cola_log.empty():
+            texto_log.configure(state=tk.NORMAL)
+            texto_log.insert(tk.END, cola_log.get() + "\n")
+            texto_log.see(tk.END)
+            texto_log.configure(state=tk.DISABLED)
 
         # Re-ejecutar cada 500 milisegundos (también marca el ritmo del parpadeo)
         ventana.after(500, cargar_datos_bd)
@@ -342,25 +675,26 @@ def Pantalla_Monitor():
 
 ######################### MAIN ##########################
 
-if len(sys.argv) == 2:
-    cargar_estaciones_bd()
-    print(f"[BD] {len(estaciones)} estaciones cargadas de la base de datos (todas en OFFLINE)")
-    mostrar_bd()
+if __name__ == "__main__":
+    if len(sys.argv) == 2:
+        cargar_estaciones_bd()
+        log(f"[BD] {len(estaciones)} estaciones cargadas de la base de datos (todas en OFFLINE)")
+        mostrar_bd()
 
-    PORT = int(sys.argv[1])
-    SERVER = "0.0.0.0"
-    ADDR = (SERVER, PORT)
+        PORT = int(sys.argv[1])
+        SERVER = "0.0.0.0"
+        ADDR = (SERVER, PORT)
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(ADDR)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(ADDR)
 
-    print(f"[STARTING] Iniciando WM_Central en {SERVER}:{PORT}...")
-    hilo_servidor = threading.Thread(target=start, args=(server, SERVER, PORT), daemon=True)
-    hilo_servidor.start()
-    Pantalla_Monitor()
-else:
-    print("Uso: python WM_Central.py <puerto_escucha>")
-    print("Ejemplo: python WM_Central.py 9999")
+        print(f"[STARTING] Iniciando WM_Central en {SERVER}:{PORT}...")
+        hilo_servidor = threading.Thread(target=start, args=(server, SERVER, PORT), daemon=True)
+        hilo_servidor.start()
+        Pantalla_Monitor()
+    else:
+        print("Uso: python WM_Central.py <puerto_escucha>")
+        print("Ejemplo: python WM_Central.py 9999")
 
 conexion.close()
