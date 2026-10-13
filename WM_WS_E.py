@@ -1,21 +1,36 @@
+# SIMULA el hardware de la estacióno de riego. Se conecta al monitor y responde a cada HEALTH con el estado de salud.
 import socket
 import sys
 import threading
 import time
 import random
 
-HEADER = 64
 FORMAT = 'utf-8'
 FIN = "FIN"
 
+# Protocolo de sockets recomendado en el enunciado: <STX><DATA><ETX><LRC>
+#   - Al conectar, el cliente envía ENQ y el servidor contesta ACK (handshake).
+#   - Cada trama recibida se confirma con ACK (LRC correcto) o NACK (corrupta);
+#     con NACK el emisor la reenvía, como mucho MAX_REINTENTOS veces.
+#   - Al cerrar de forma ordenada se envía EOT.
+STX = b'\x02'
+ETX = b'\x03'
+EOT = b'\x04'
+ENQ = b'\x05'
+ACK = b'\x06'
+NACK = b'\x15'
+MAX_REINTENTOS = 3
+MAX_TRAMA = 1024        # bytes de DATA como máximo; más largo se considera basura
+
 # Protocolo Monitor <-> Engine (el mismo que en WM_WS_M)
-HEALTH = "HEALTH"       # pregunta del monitor cada segundo
+HEALTH = "HEALTH"       # pregunta del monitor cada segundo, a la que el engine responde con OK o KO según su estado de salud
 OK = "OK"               # todo funciona
 KO = "KO"               # avería simulada (fuga)
 REINTENTO_MONITOR = 3   # segundos entre intentos de conexión al monitor
+TIMEOUT_MONITOR = 5     # segundos sin recibir nada del monitor = monitor caído (envía HEALTH cada segundo)
 
 # Simulación del caudalímetro (litros/minuto)
-CAUDAL_MIN = 15.0
+CAUDAL_MIN = 15.0 # el caudal simulado es un número aleatorio entre 15 y 25
 CAUDAL_MAX = 25.0
 OPERARIO_LOCAL = "LOCAL"    # riego activado desde el menú de la propia estación
 
@@ -37,37 +52,106 @@ riego = None
 lock_riego = threading.Lock()
 
 
-def send(client, msg):
-    message = msg.encode(FORMAT)
-    header = f"{len(message):<{HEADER}}".encode(FORMAT)
-    client.sendall(header + message)
+########## PROTOCOLO <STX><DATA><ETX><LRC> ##########
+
+def calcular_lrc(datos):
+    # XOR byte a byte del mensaje
+    lrc = 0
+    for byte in datos:
+        lrc ^= byte
+    return lrc
 
 
-def recive_msg(sock, size):
-    solu = None
+def empaquetar(msg):
+    datos = msg.encode(FORMAT)
+    if STX in datos or ETX in datos:
+        raise ValueError("el mensaje no puede contener los caracteres STX/ETX")
+    return STX + datos + ETX + bytes([calcular_lrc(datos)])
+
+
+def recibir_bytes(sock, size):
+    # recv puede devolver menos bytes de los pedidos: se repite hasta tenerlos todos
     data = bytearray()
     while len(data) < size:
-        part = sock.recv(size-len(data))
-
+        part = sock.recv(size - len(data))
         if not part:
-            return solu
+            return None
         data.extend(part)
-
     return bytes(data)
 
-def receive(client):
-    solu = None
-    header = recive_msg(client, HEADER)
-    if header == solu:
-        return solu
 
-    msg_length = int(header.decode(FORMAT).strip())
-    message = recive_msg(client, msg_length)
+def recibir_trama(sock):
+    # Devuelve (datos, lrc_correcto) o None si la conexión se cierra o llega EOT
+    byte = recibir_bytes(sock, 1)
+    while byte is not None and byte != STX:   # se descarta lo que haya antes de STX
+        if byte == EOT:
+            return None
+        byte = recibir_bytes(sock, 1)
+    if byte is None:
+        return None
 
-    if message == solu:
-        return solu
+    datos = bytearray()
+    byte = recibir_bytes(sock, 1)
+    while byte is not None and byte != ETX and len(datos) <= MAX_TRAMA:
+        datos.extend(byte)
+        byte = recibir_bytes(sock, 1)
+    if byte is None:
+        return None
+    if byte != ETX:
+        return bytes(datos), False
 
-    return message.decode(FORMAT)
+    lrc = recibir_bytes(sock, 1)
+    if lrc is None:
+        return None
+    return bytes(datos), lrc[0] == calcular_lrc(datos)
+
+
+def send(sock, msg):
+    # Envía la trama y espera su ACK. Con NACK (o respuesta rara) se reenvía.
+    trama = empaquetar(msg)
+    for _ in range(MAX_REINTENTOS):
+        sock.sendall(trama)
+        confirmacion = recibir_bytes(sock, 1)
+        if confirmacion is None:
+            raise ConnectionError("conexión cerrada esperando ACK")
+        if confirmacion == ACK:
+            return
+    raise ConnectionError(f"trama rechazada {MAX_REINTENTOS} veces")
+
+
+def receive(sock):
+    # Recibe una trama, la valida con el LRC y contesta ACK o NACK.
+    # Devuelve el mensaje, o None si el otro extremo ha cerrado.
+    for _ in range(MAX_REINTENTOS):
+        trama = recibir_trama(sock)
+        if trama is None:
+            return None
+        datos, correcta = trama
+        if correcta:
+            try:
+                msg = datos.decode(FORMAT)
+                sock.sendall(ACK)
+                return msg
+            except UnicodeDecodeError:
+                pass
+        sock.sendall(NACK)
+    raise ConnectionError(f"{MAX_REINTENTOS} tramas corruptas seguidas")
+
+
+def saludar(sock):
+    # Handshake del lado cliente: ENQ -> ACK
+    sock.sendall(ENQ)
+    if recibir_bytes(sock, 1) != ACK:
+        raise ConnectionError("el servidor no aceptó el ENQ")
+
+
+def despedirse(sock):
+    # Cierre ordenado: EOT y close (si el otro ya cerró, da igual)
+    try:
+        sock.sendall(EOT)
+    except OSError:
+        pass
+    sock.close()
 
 
 def publicar_evento(mensaje):
@@ -91,16 +175,9 @@ def iniciar_riego(operario, limite):
             return False, "hay una avería (fuga) detectada"
         if riego is not None:
             return False, "ya hay un riego en curso"
-
-        riego = {
-            "operario": operario,
-            "limite": limite,
-            "inicio": time.time(),
-            "volumen": 0.0,
-            "caudal": 0.0,
-            "motivo_fin": None,
-            "despertar": threading.Event()  # permite cortar el riego sin esperar al segundo
-        }
+        # permite cortar el riego sin esperar al segundo
+        riego = {"operario": operario,"limite": limite,"inicio": time.time(),"volumen": 0.0,"caudal": 0.0,"motivo_fin": None,"despertar": threading.Event()}  
+        # se crea el hilo del riego
         riego["hilo"] = threading.Thread(target=bucle_riego, args=(riego,), daemon=True)
 
     print(f"\n[RIEGO] Electroválvula ABIERTA. Operario: {operario} | Límite: {limite} s")
@@ -119,7 +196,7 @@ def parar_riego(motivo):
     return True
 
 
-def bucle_riego(r):
+def bucle_riego(r): # Solo existe mientras se riega: mie el caudal cada segundo y decide cuándo parar
     # Cada segundo mide el caudal, acumula el volumen y comprueba si hay que parar
     global riego
     terminado = False
@@ -150,13 +227,16 @@ def bucle_riego(r):
     publicar_evento(f"RIEGO_FIN#{id_ws}#{r['operario']}#{r['volumen']:.2f}#{duracion}#{r['motivo_fin']}")
 
 
-def atender_monitor(addr_monitor):
+def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID y responde a cada HEALTH
     # Se conecta al monitor y responde a cada HEALTH con el estado actual.
     # Si el monitor se cae, vuelve a intentarlo cada REINTENTO_MONITOR segundos.
     global id_ws
     while True:
         try:
-            conn = socket.create_connection(addr_monitor)
+            # El timeout queda puesto en el socket: si el monitor deja de enviar
+            # HEALTH (caída silenciosa, red cortada...) el receive salta y se reconecta
+            conn = socket.create_connection(addr_monitor, timeout=TIMEOUT_MONITOR)
+            saludar(conn)
         except OSError:
             print(f"\n[MONITOR] No se puede conectar a {addr_monitor}, reintentando en {REINTENTO_MONITOR}s")
             time.sleep(REINTENTO_MONITOR)
@@ -166,7 +246,10 @@ def atender_monitor(addr_monitor):
         conectado = True
         while conectado:
             try:
-                mensaje = receive(conn)
+                mensaje = receive(conn) # recibe el mensaje del monitor
+            except socket.timeout:
+                print(f"\n[MONITOR] {TIMEOUT_MONITOR}s sin noticias del monitor")
+                mensaje = None
             except OSError:
                 mensaje = None
 
@@ -177,13 +260,13 @@ def atender_monitor(addr_monitor):
                 print(f"[MONITOR] ID asignado a este engine: {id_ws}")
             elif mensaje == HEALTH:
                 try:
-                    send(conn, estado_engine)
+                    send(conn, estado_engine) # estado de saludo del engine
                 except OSError:
                     conectado = False
             else:
                 print(f"\n[MONITOR] Mensaje desconocido: {mensaje}")
 
-        conn.close()
+        despedirse(conn)
         print(f"\n[MONITOR] Conexión con el monitor perdida, reintentando en {REINTENTO_MONITOR}s")
         time.sleep(REINTENTO_MONITOR)
 

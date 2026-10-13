@@ -8,9 +8,25 @@ import tkinter as tk
 from tkinter import ttk
 
 
-HEADER = 64
 FORMAT = 'utf-8'
 FIN = "FIN"
+
+# Protocolo de sockets recomendado en el enunciado: <STX><DATA><ETX><LRC>
+#   - Al conectar, el cliente envía ENQ y el servidor contesta ACK (handshake).
+#   - Cada trama recibida se confirma con ACK (LRC correcto) o NACK (corrupta);
+#     con NACK el emisor la reenvía, como mucho MAX_REINTENTOS veces.
+#   - Al cerrar de forma ordenada se envía EOT.
+# Mensajería de los frofes
+STX = b'\x02'
+ETX = b'\x03'
+EOT = b'\x04'
+ENQ = b'\x05'
+ACK = b'\x06'
+NACK = b'\x15'
+MAX_REINTENTOS = 3
+MAX_TRAMA = 1024        # bytes de DATA como máximo; más largo se considera basura
+
+TIMEOUT_MONITOR = 10    # segundos sin recibir nada de un monitor (envía PING cada 2 s) = desconectado
 
 # Disponible, Regando, Fuga, Fuera de servicio, Desconectada
 ESTADOS_WS = ("AVAILABLE", "WATERING", "LEAK", "STOPPED", "OFFLINE")
@@ -424,12 +440,22 @@ def desconectar_estacion(id_estacion):
     if estado_anterior == "WATERING":
         finalizar_riego_bd(id_estacion, None, None, "DESCONEXION")
 
-def send_msg(conn, msg):
-    message = msg.encode(FORMAT)
-    header = f"{len(message):<{HEADER}}".encode(FORMAT)
-    conn.sendall(header + message)
+def calcular_lrc(datos):
+    # XOR byte a byte del mensaje
+    lrc = 0
+    for byte in datos:
+        lrc ^= byte
+    return lrc
 
-def recive_msg(sock, size):
+
+def empaquetar(msg):
+    datos = msg.encode(FORMAT)
+    if STX in datos or ETX in datos:
+        raise ValueError("el mensaje no puede contener los caracteres STX/ETX")
+    return STX + datos + ETX + bytes([calcular_lrc(datos)])
+
+
+def recibir_bytes(sock, size):
     # recv puede devolver menos bytes de los pedidos: se repite hasta tenerlos todos
     data = bytearray()
     while len(data) < size:
@@ -439,27 +465,155 @@ def recive_msg(sock, size):
         data.extend(part)
     return bytes(data)
 
-def receive_msg(conn):
-    header = recive_msg(conn, HEADER)
-    if header is None:
+
+def recibir_trama(sock):
+    # Devuelve (datos, lrc_correcto) o None si la conexión se cierra o llega EOT
+    byte = recibir_bytes(sock, 1)
+    while byte is not None and byte != STX:   # se descarta lo que haya antes de STX
+        if byte == EOT:
+            return None
+        byte = recibir_bytes(sock, 1)
+    if byte is None:
         return None
 
-    msg_length = int(header.decode(FORMAT).strip())
-    message = recive_msg(conn, msg_length)
-    if message is None:
+    datos = bytearray()
+    byte = recibir_bytes(sock, 1)
+    while byte is not None and byte != ETX and len(datos) <= MAX_TRAMA:
+        datos.extend(byte)
+        byte = recibir_bytes(sock, 1)
+    if byte is None:
         return None
+    if byte != ETX:
+        return bytes(datos), False
 
-    return message.decode(FORMAT)
+    lrc = recibir_bytes(sock, 1)
+    if lrc is None:
+        return None
+    return bytes(datos), lrc[0] == calcular_lrc(datos)
+
+
+def send_msg(sock, msg):
+    # Envía la trama y espera su ACK. Con NACK (o respuesta rara) se reenvía.
+    trama = empaquetar(msg)
+    for _ in range(MAX_REINTENTOS):
+        sock.sendall(trama)
+        confirmacion = recibir_bytes(sock, 1)
+        if confirmacion is None:
+            raise ConnectionError("conexión cerrada esperando ACK")
+        if confirmacion == ACK:
+            return
+    raise ConnectionError(f"trama rechazada {MAX_REINTENTOS} veces")
+
+
+def receive_msg(sock):
+    # Recibe una trama, la valida con el LRC y contesta ACK o NACK.
+    # Devuelve el mensaje, o None si el otro extremo ha cerrado.
+    for _ in range(MAX_REINTENTOS):
+        trama = recibir_trama(sock)
+        if trama is None:
+            return None
+        datos, correcta = trama
+        if correcta:
+            try:
+                msg = datos.decode(FORMAT)
+                sock.sendall(ACK)
+                return msg
+            except UnicodeDecodeError:
+                pass
+        sock.sendall(NACK)
+    raise ConnectionError(f"{MAX_REINTENTOS} tramas corruptas seguidas")
+
+
+def aceptar_saludo(sock):
+    # Handshake del lado servidor: espera ENQ y contesta ACK
+    if recibir_bytes(sock, 1) == ENQ:
+        sock.sendall(ACK)
+        return True
+    return False
+
+
+def despedirse(sock):
+    # Cierre ordenado: EOT y close (si el otro ya cerró, da igual)
+    try:
+        sock.sendall(EOT)
+    except OSError:
+        pass
+    sock.close()
+
+
+def atender_mensaje(conn, addr, msg, id_estacion_actual):
+    # Procesa un mensaje del monitor y le responde.
+    # Devuelve (id de la estación de esta conexión, si la conexión sigue abierta)
+    partes = msg.split('#')
+    comando = partes[0]
+
+    if comando == "REGISTER" and len(partes) >= 3 and id_estacion_actual is None:
+        id_estacion = partes[1]
+        ubicacion = partes[2]
+
+        if registrar_estacion(id_estacion, ubicacion, conn, addr):
+            log(f"[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada desde {addr}")
+            send_msg(conn, f"ACK#REGISTER_OK#{id_estacion}")
+            mostrar_bd()
+            return id_estacion, True
+
+        log(f"[REGISTRO KO] '{id_estacion}' ya está conectada, se rechaza {addr}")
+        send_msg(conn, f"NACK#REGISTER_KO#{id_estacion}#ID ya conectado")
+        return None, False
+
+    # Autenticación: hasta registrarse solo se acepta REGISTER
+    if id_estacion_actual is None:
+        print(f"[CENTRAL] {addr} envía '{msg}' sin estar registrado")
+        send_msg(conn, "NACK#NO_REGISTRADO#Primero hay que enviar REGISTER#id#ubicacion")
+        return None, True
+
+    if comando == "PING":
+        # Latido del monitor: solo sirve para saber que la conexión sigue viva
+        send_msg(conn, f"ACK#PONG#{id_estacion_actual}")
+
+    elif comando == "ESTADO" and len(partes) >= 3:
+        id_estacion = partes[1]
+        nuevo_estado = partes[2]
+
+        # Un monitor solo puede cambiar el estado de su propia estación
+        if id_estacion == id_estacion_actual and nuevo_estado in ESTADOS_WS:
+            estado_final = cambiar_estado_monitor(id_estacion, nuevo_estado)
+            log(f"[ESTADO] Estación '{id_estacion}' -> {estado_final}")
+            send_msg(conn, f"ACK#ESTADO_OK#{id_estacion}#{estado_final}")
+            mostrar_bd()
+        else:
+            print(f"[ESTADO] Mensaje de estado no válido: {msg}")
+            send_msg(conn, f"NACK#ESTADO_KO#{id_estacion}")
+
+    elif comando == "REGISTER":
+        send_msg(conn, f"NACK#REGISTER_KO#{id_estacion_actual}#Esta conexión ya está registrada")
+
+    else:
+        print(f"[CENTRAL] Recibido de [{id_estacion_actual}]: {msg}")
+        send_msg(conn, f"ACK#OK#Recibido: {msg}")
+
+    return id_estacion_actual, True
 
 def handle_client(conn, addr):
     print(f"[NUEVA CONEXION] {addr} connected.")
 
+    # Con el timeout, una estación que deja de enviar PING (red caída, PC apagado
+    # sin cerrar el socket...) se detecta y pasa a OFFLINE
+    conn.settimeout(TIMEOUT_MONITOR)
     id_estacion_actual = None
     connected = True
-    while connected:
+
+    # try/finally: pase lo que pase (FIN, corte, excepción) la estación queda OFFLINE
+    try:
+        if not aceptar_saludo(conn):
+            print(f"[HANDSHAKE] {addr} no ha empezado con ENQ, se cierra la conexión")
+            connected = False
+
+        while connected:
             try:
                 msg = receive_msg(conn)
-            except (OSError, ValueError):  # conexión cortada o cabecera corrupta
+            except socket.timeout:
+                log(f"[LATIDO] Sin noticias de '{id_estacion_actual or addr}' en {TIMEOUT_MONITOR}s")
                 msg = None
 
             if msg is None:
@@ -468,50 +622,15 @@ def handle_client(conn, addr):
                 connected = False
                 print(f"[FIN] La estación '{id_estacion_actual}' ha enviado FIN")
             else:
-                partes = msg.split('#')
-                comando = partes[0]
-
-                if comando == "REGISTER" and len(partes) >= 3 and id_estacion_actual is None:
-                    id_estacion = partes[1]
-                    ubicacion = partes[2]
-
-                    if registrar_estacion(id_estacion, ubicacion, conn, addr):
-                        id_estacion_actual = id_estacion
-                        log(f"[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada desde {addr}")
-                        send_msg(conn, f"ACK#REGISTER_OK#{id_estacion}")
-                        mostrar_bd()
-                    else:
-                        log(f"[REGISTRO KO] '{id_estacion}' ya está conectada, se rechaza {addr}")
-                        send_msg(conn, f"NACK#REGISTER_KO#{id_estacion}#ID ya conectado")
-                        connected = False
-
-                elif comando == "ESTADO" and len(partes) >= 3:
-                    id_estacion = partes[1]
-                    nuevo_estado = partes[2]
-
-                    # Un monitor solo puede cambiar el estado de su propia estación
-                    if id_estacion == id_estacion_actual and nuevo_estado in ESTADOS_WS:
-                        estado_final = cambiar_estado_monitor(id_estacion, nuevo_estado)
-                        log(f"[ESTADO] Estación '{id_estacion}' -> {estado_final}")
-                        send_msg(conn, f"ACK#ESTADO_OK#{id_estacion}#{estado_final}")
-                        mostrar_bd()
-                    else:
-                        print(f"[ESTADO] Mensaje de estado no válido: {msg}")
-                        send_msg(conn, f"NACK#ESTADO_KO#{id_estacion}")
-
-                else:
-                    print(f"[CENTRAL] Recibido de [{id_estacion_actual or addr}]: {msg}")
-                    respuesta = f"ACK#OK#Recibido: {msg}"
-                    send_msg(conn, respuesta)
-
-    # Tanto si llega FIN como si se corta la conexión, la estación queda desconectada
-    if id_estacion_actual is not None:
-        desconectar_estacion(id_estacion_actual)
-        log(f"[DESCONEXION] Estación '{id_estacion_actual}' marcada como OFFLINE")
-        mostrar_bd()
-
-    conn.close()
-
+                id_estacion_actual, connected = atender_mensaje(conn, addr, msg, id_estacion_actual)
+    except OSError as e:  # conexión cortada, reseteada o demasiadas tramas corruptas
+        print(f"[CONEXION] Error con {id_estacion_actual or addr}: {e}")
+    finally:
+        if id_estacion_actual is not None:
+            desconectar_estacion(id_estacion_actual)
+            log(f"[DESCONEXION] Estación '{id_estacion_actual}' marcada como OFFLINE")
+            mostrar_bd()
+        despedirse(conn)
 
 
 def start(server, ip, port):
