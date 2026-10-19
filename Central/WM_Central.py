@@ -8,7 +8,6 @@ import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk   # Tkinter no abre JPG por sí solo (pip install pillow)
 
-
 FORMAT = 'utf-8'
 FIN = "FIN"
 
@@ -69,12 +68,18 @@ cursor.execute("""
     CREATE TABLE IF NOT EXISTS estaciones(
         ID TEXT PRIMARY KEY,
         Location TEXT NOT NULL,
+        Sector TEXT,
         Status TEXT NOT NULL,
         Flow REAL,
         Accum INTEGER,
         Operator TEXT
     )
 """)
+
+try:
+    cursor.execute("ALTER TABLE estaciones ADD COLUMN Sector TEXT")
+except sqlite3.OperationalError:
+    pass
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS operarios(
@@ -112,12 +117,62 @@ lock_estaciones = threading.Lock()
 # tocar la ventana de Tkinter, así que dejan los mensajes en esta cola y el panel los recoge.
 cola_log = queue.Queue()
 
+ZONAS_SECTORES = {
+    "Invernadero": [
+        (100, 50), (150, 50)
+    ],
+    "Cripta": [
+        (250, 50), (300, 50), (300, 100), (350, 100)
+    ],
+    "Bosque_Dioses": [
+        (100, 100), (150, 100), (100, 150), (150, 150), 
+        (200, 150), (250, 150), (100, 200), (150, 200), (200, 200)
+    ],
+    "Patio_Este": [
+        (300, 150), (350, 150), (400, 100), (400, 150)
+    ],
+    "Patio_Armas": [
+        (250, 200), (300, 200), (250, 250), (300, 250)
+    ],
+    "Establos": [
+        (150, 300), (200, 300), (250, 300), (300, 300), 
+        (250, 350), (300, 350)
+    ],
+    "Septo": [
+        (350, 250), (400, 250), (350, 300), (400, 300), (350, 350)
+    ]
+}
+
 def log(mensaje):
     print(mensaje)
     cola_log.put(f"{time.strftime('%H:%M:%S')}  {mensaje}")
 
 def ahora():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def obtener_sectores_ocupados():
+    ocupados = set()
+    for e in estaciones.values():
+        if e.get("sector") is not None and e.get("estado") != "OFFLINE":
+            ocupados.add(e["sector"])
+    return ocupados
+
+def asignar_sector(id_estacion, ubicacion, sector_idx=None):
+    if ubicacion not in ZONAS_SECTORES:
+        return None
+    lista = ZONAS_SECTORES[ubicacion]
+    ocupados = obtener_sectores_ocupados()
+    if id_estacion in estaciones and estaciones[id_estacion].get("sector") in lista:
+        ocupados.discard(estaciones[id_estacion]["sector"])
+    if sector_idx is not None and isinstance(sector_idx, int) and 0 <= sector_idx < len(lista):
+        cand = lista[sector_idx]
+        if cand not in ocupados:
+            return cand
+        return None
+    for cand in lista:
+        if cand not in ocupados:
+            return cand
+    return None
 
 def cargar_estaciones_bd():
     # Al arrancar no sabemos el estado real de ninguna estación hasta que se
@@ -138,11 +193,19 @@ def cargar_estaciones_bd():
     """, (ahora(),))
     conexion.commit()
 
-    cursor.execute("SELECT ID, Location FROM estaciones")
-    for id_estacion, ubicacion in cursor.fetchall():
+    cursor.execute("SELECT ID, Location, Sector FROM estaciones")
+    for id_estacion, ubicacion, sector_raw in cursor.fetchall():
+        sector = None
+        if sector_raw:
+            try:
+                p = sector_raw.split(',')
+                sector = (int(p[0]), int(p[1]))
+            except Exception:
+                sector = None
         estaciones[id_estacion] = {
             "id": id_estacion,
             "ubicacion": ubicacion,
+            "sector": sector,
             "estado": "OFFLINE",
             "bloqueada": False,
             "addr": None,
@@ -158,7 +221,9 @@ def guardar_estacion_bd(estaciones, id):
     estacion = estaciones[id]
 
     id_estacion = estacion["id"]
-    ubicacion = estacion ["ubicacion"]
+    ubicacion = estacion["ubicacion"]
+    sector = estacion.get("sector")
+    sector_str = f"{sector[0]},{sector[1]}" if sector else None
     estado = estacion["estado"]
 
     cursor.execute("SELECT * FROM estaciones WHERE ID = ?", (id_estacion,))
@@ -166,14 +231,14 @@ def guardar_estacion_bd(estaciones, id):
     if cursor.fetchone() is not None:
         cursor.execute("""
             UPDATE estaciones
-            SET Status = ?, Location = ?
+            SET Status = ?, Location = ?, Sector = ?
             WHERE ID = ?
-        """, (estado, ubicacion, id_estacion))
+        """, (estado, ubicacion, sector_str, id_estacion))
     else:
         cursor.execute("""
-            INSERT INTO estaciones (ID, Location, Status)
-            VALUES (?,?,?)
-            """, (id_estacion,ubicacion, estado)
+            INSERT INTO estaciones (ID, Location, Sector, Status)
+            VALUES (?,?,?,?)
+            """, (id_estacion, ubicacion, sector_str, estado)
         )
     conexion.commit()
     conexion.close()
@@ -392,7 +457,7 @@ def aplicar_orden(id_estacion, funcion, *args):
 
 ########## SOCKETS ##########
 
-def registrar_estacion(id_estacion, ubicacion, conn, addr):
+def registrar_estacion(id_estacion, ubicacion, conn, addr, sector_idx=None):
     # Autenticación: se rechaza un ID que ya tiene un monitor conectado.
     # Comprobar y dar de alta va dentro del lock para que dos monitores con el
     # mismo ID que lleguen a la vez no puedan pasar los dos.
@@ -400,11 +465,16 @@ def registrar_estacion(id_estacion, ubicacion, conn, addr):
         if id_estacion in estaciones and estaciones[id_estacion]["conn"] is not None:
             return False
 
+        sec = asignar_sector(id_estacion, ubicacion, sector_idx)
+        if sec is None:
+            return False
+
         # Si la central la había bloqueado, sigue bloqueada al reconectarse
         bloqueada = id_estacion in estaciones and estaciones[id_estacion]["bloqueada"]
         estaciones[id_estacion] = {
             "id": id_estacion,
             "ubicacion": ubicacion,
+            "sector": sec,
             "estado": "STOPPED" if bloqueada else "AVAILABLE",
             "bloqueada": bloqueada,
             "addr": addr,
@@ -551,15 +621,16 @@ def atender_mensaje(conn, addr, msg, id_estacion_actual):
     if comando == "REGISTER" and len(partes) >= 3 and id_estacion_actual is None:
         id_estacion = partes[1]
         ubicacion = partes[2]
+        sector_idx = int(partes[3]) if len(partes) > 3 and partes[3].isdigit() else None
 
-        if registrar_estacion(id_estacion, ubicacion, conn, addr):
+        if registrar_estacion(id_estacion, ubicacion, conn, addr, sector_idx):
             log(f"[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada desde {addr}")
             send_msg(conn, f"ACK#REGISTER_OK#{id_estacion}")
             mostrar_bd()
             return id_estacion, True
 
-        log(f"[REGISTRO KO] '{id_estacion}' ya está conectada, se rechaza {addr}")
-        send_msg(conn, f"NACK#REGISTER_KO#{id_estacion}#ID ya conectado")
+        log(f"[REGISTRO KO] '{id_estacion}' ya está conectada o sector ocupado, se rechaza {addr}")
+        send_msg(conn, f"NACK#REGISTER_KO#{id_estacion}#ID o Sector no disponible")
         return None, False
 
     # Autenticación: hasta registrarse solo se acepta REGISTER
@@ -636,7 +707,7 @@ def handle_client(conn, addr):
 
 def start(server, ip, port):
     server.listen()
-    print(f"[LISTENING] Servidor a la escucha en {SERVER}")
+    print(f"[LISTENING] Servidor a la escucha en {ip}:{port}")
     while True:
         conn, addr = server.accept()
         thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
@@ -766,7 +837,7 @@ def Pantalla_Monitor():
 
     lbl_reloj = tk.Label(cabecera, font=(FUENTE, 13, "bold"), bg=C_CABECERA, fg="white")
     lbl_reloj.pack(side=tk.RIGHT, padx=20)
-    puerto = globals().get("PORT", "-")
+    puerto = globals().get("PORT", 5050)
     tk.Label(cabecera, text=f"●  En servicio · puerto {puerto}", font=(FUENTE, 9, "bold"),
              bg=C_CABECERA, fg="#7ed491").pack(side=tk.RIGHT, padx=10)
 
@@ -813,19 +884,20 @@ def Pantalla_Monitor():
     frame_izq = tk.Frame(cuerpo, bg=C_FONDO)
     frame_izq.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
     frame_izq.rowconfigure(0, weight=3)
+    frame_izq.rowconfigure(1, weight=0)
     frame_izq.rowconfigure(2, weight=2)
     frame_izq.columnconfigure(0, weight=1)
 
     borde_tabla, tarjeta_tabla = crear_tarjeta(frame_izq, "Estado de las estaciones")
-    borde_tabla.grid(row=0, column=0, sticky="nsew")
+    borde_tabla.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
 
     frame_tabla = tk.Frame(tarjeta_tabla, bg=C_TARJETA)
     frame_tabla.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
 
-    columnas = ("ID", "Location", "Status", "Flow", "Accum", "Operator")
-    cabeceras = {"ID": "ID", "Location": "Ubicación", "Status": "Estado", "Flow": "Caudal",
+    columnas = ("ID", "Location", "Sector", "Status", "Flow", "Accum", "Operator")
+    cabeceras = {"ID": "ID", "Location": "Ubicación", "Sector": "Sector", "Status": "Estado", "Flow": "Caudal",
                  "Accum": "Acumulado", "Operator": "Operario"}
-    anchos = {"ID": 70, "Location": 150, "Status": 150, "Flow": 100, "Accum": 95, "Operator": 90}
+    anchos = {"ID": 60, "Location": 110, "Sector": 90, "Status": 120, "Flow": 80, "Accum": 80, "Operator": 80}
     tabla = ttk.Treeview(frame_tabla, columns=columnas, show="headings", height=8)
     for col in columnas:
         tabla.heading(col, text=cabeceras[col].upper())
@@ -833,213 +905,161 @@ def Pantalla_Monitor():
     tabla.column("Location", anchor=tk.W)
     tabla.heading("Location", anchor=tk.W)
 
-    # Una etiqueta (tag) por estado con su color de fondo y de texto
     for estado, color in COLOR_ESTADO.items():
         tabla.tag_configure(estado, background=color, foreground=TEXTO_COLOR_ESTADO.get(estado, C_TEXTO))
 
     scrollbar = ttk.Scrollbar(frame_tabla, orient=tk.VERTICAL, command=tabla.yview)
-    tabla.configure(yscroll=scrollbar.set)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    tabla.configure(yscrollcommand=scrollbar.set)
     tabla.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-    # Órdenes de la central sobre una o todas las estaciones (punto 11)
-    borde_ordenes, tarjeta_ordenes = crear_tarjeta(frame_izq, "Órdenes de la central")
-    borde_ordenes.grid(row=1, column=0, sticky="ew", pady=14)
+    borde_ordenes, tarjeta_ordenes = crear_tarjeta(frame_izq, "Acciones de control")
+    borde_ordenes.grid(row=1, column=0, sticky="ew", pady=(0, 10))
 
-    frame_ordenes = tk.Frame(tarjeta_ordenes, bg=C_TARJETA)
-    frame_ordenes.pack(fill=tk.X, padx=14, pady=(0, 14))
+    f_ctrl = tk.Frame(tarjeta_ordenes, bg=C_TARJETA)
+    f_ctrl.pack(fill=tk.X, padx=14, pady=(0, 14))
 
-    def campo(etiqueta, columna):
-        tk.Label(frame_ordenes, text=etiqueta, font=(FUENTE, 9), bg=C_TARJETA,
-                 fg=C_TEXTO_SUAVE).grid(row=0, column=columna, sticky="w", padx=(0, 12))
+    tk.Label(f_ctrl, text="Estación:", font=(FUENTE, 9, "bold"), bg=C_TARJETA).grid(row=0, column=0, sticky="w", padx=(0, 5))
+    combo_estaciones = ttk.Combobox(f_ctrl, values=[TODAS], state="readonly", width=12)
+    combo_estaciones.set(TODAS)
+    combo_estaciones.grid(row=0, column=1, sticky="w", padx=(0, 15))
 
-    campo("Estación", 0)
-    combo_estacion = ttk.Combobox(frame_ordenes, values=[TODAS], state="readonly", width=12)
-    combo_estacion.set(TODAS)
-    combo_estacion.grid(row=1, column=0, sticky="w", padx=(0, 12))
+    tk.Label(f_ctrl, text="Límite (s):", font=(FUENTE, 9, "bold"), bg=C_TARJETA).grid(row=0, column=2, sticky="w", padx=(0, 5))
+    spin_limite = ttk.Spinbox(f_ctrl, from_=10, to=3600, increment=10, width=6)
+    spin_limite.set(60)
+    spin_limite.grid(row=0, column=3, sticky="w", padx=(0, 15))
 
-    campo("Duración (s)", 1)
-    spin_duracion = ttk.Spinbox(frame_ordenes, from_=5, to=3600, increment=5, width=7)
-    spin_duracion.set("30")
-    spin_duracion.grid(row=1, column=1, sticky="w", padx=(0, 12))
+    def cmd_regar():
+        target = combo_estaciones.get()
+        lim = int(spin_limite.get())
+        aplicar_orden(target, orden_iniciar_riego, lim)
 
-    frame_ordenes.columnconfigure(2, weight=1)
+    def cmd_bloquear():
+        target = combo_estaciones.get()
+        aplicar_orden(target, orden_bloquear)
 
-    def pulsar_regar():
-        duracion = spin_duracion.get().strip()
-        if not duracion.isdigit() or int(duracion) <= 0:
-            log("[RIEGO] La duración debe ser un número de segundos mayor que 0")
-        else:
-            aplicar_orden(combo_estacion.get(), orden_iniciar_riego, int(duracion))
+    def cmd_activar():
+        target = combo_estaciones.get()
+        aplicar_orden(target, orden_activar)
 
-    ttk.Button(frame_ordenes, text="▶  Iniciar riego", style="Regar.TButton", cursor="hand2",
-               command=pulsar_regar).grid(row=1, column=3, padx=(0, 8))
-    ttk.Button(frame_ordenes, text="■  Bloquear", style="Bloquear.TButton", cursor="hand2",
-               command=lambda: aplicar_orden(combo_estacion.get(), orden_bloquear)).grid(row=1, column=4, padx=(0, 8))
-    ttk.Button(frame_ordenes, text="✔  Activar", style="Activar.TButton", cursor="hand2",
-               command=lambda: aplicar_orden(combo_estacion.get(), orden_activar)).grid(row=1, column=5)
+    btn_regar = ttk.Button(f_ctrl, text="REGAR", style="Regar.TButton", command=cmd_regar)
+    btn_regar.grid(row=0, column=4, padx=5)
 
-    # Al pinchar una fila se selecciona esa estación en el desplegable. Después se
-    # quita la selección para que el color de selección no tape el color del estado.
-    def seleccionar_fila(evento):
-        seleccion = tabla.selection()
-        if seleccion:
-            combo_estacion.set(seleccion[0])
-            tabla.selection_remove(seleccion)
-    tabla.bind("<<TreeviewSelect>>", seleccionar_fila)
+    btn_bloquear = ttk.Button(f_ctrl, text="BLOQUEAR", style="Bloquear.TButton", command=cmd_bloquear)
+    btn_bloquear.grid(row=0, column=5, padx=5)
 
-    # Registro de eventos: mensajes de autorización, denegación, órdenes, estados...
+    btn_activar = ttk.Button(f_ctrl, text="ACTIVAR", style="Activar.TButton", command=cmd_activar)
+    btn_activar.grid(row=0, column=6, padx=5)
+
     borde_log, tarjeta_log = crear_tarjeta(frame_izq, "Registro de eventos")
     borde_log.grid(row=2, column=0, sticky="nsew")
 
-    frame_log = tk.Frame(tarjeta_log, bg="#161b22")
-    frame_log.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
-    texto_log = tk.Text(frame_log, height=8, state=tk.DISABLED, font=("Consolas", 9), bg="#161b22",
-                        fg=COLOR_LOG["normal"], relief="flat", bd=0, padx=10, pady=8, wrap=tk.WORD,
-                        insertbackground="white", selectbackground="#2d4f7c")
-    scroll_log = ttk.Scrollbar(frame_log, orient=tk.VERTICAL, command=texto_log.yview)
-    texto_log.configure(yscrollcommand=scroll_log.set)
+    f_log = tk.Frame(tarjeta_log, bg=C_TARJETA)
+    f_log.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
+
+    txt_log = tk.Text(f_log, bg="#1e2836", fg="#d8dee9", font=("Consolas", 9), relief="flat", wrap="word")
+    scroll_log = ttk.Scrollbar(f_log, orient=tk.VERTICAL, command=txt_log.yview)
+    txt_log.configure(yscrollcommand=scroll_log.set)
+    txt_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     scroll_log.pack(side=tk.RIGHT, fill=tk.Y)
-    texto_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    for tipo, color in COLOR_LOG.items():
-        texto_log.tag_configure(tipo, foreground=color)
 
-    # ---------- Columna derecha: mapa y leyenda ----------
-    borde_mapa, tarjeta_mapa = crear_tarjeta(cuerpo, "Mapa de zonas")
-    borde_mapa.grid(row=1, column=1, sticky="nsew")
+    for k, v in COLOR_LOG.items():
+        txt_log.tag_config(k, foreground=v)
 
-    # Leyenda de colores de la tabla (abajo; el mapa ocupa el resto de la tarjeta)
-    leyenda = tk.Frame(tarjeta_mapa, bg=C_TARJETA)
-    leyenda.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(8, 14))
+    frame_der = tk.Frame(cuerpo, bg=C_FONDO)
+    frame_der.grid(row=1, column=1, sticky="nsew")
+    frame_der.rowconfigure(0, weight=1)
+    frame_der.columnconfigure(0, weight=1)
 
-    # Zona del mapa: no toma su tamaño de la imagen, sino al revés
-    zona_mapa = tk.Frame(tarjeta_mapa, bg=C_TARJETA, width=1, height=1)
-    zona_mapa.pack(fill=tk.BOTH, expand=True, padx=14)
-    zona_mapa.pack_propagate(False)
+    borde_mapa, tarjeta_mapa = crear_tarjeta(frame_der, "Mapa de Sectores")
+    borde_mapa.grid(row=0, column=0, sticky="nsew")
 
-    try:
-        mapa_original = Image.open("InvernaliaZonas.jpg")
-        lbl_imagen = tk.Label(zona_mapa, bg=C_TARJETA)
-        lbl_imagen.pack(expand=True)
+    f_mapa = tk.Frame(tarjeta_mapa, bg=C_TARJETA)
+    f_mapa.pack(fill=tk.BOTH, expand=True, padx=14, pady=(0, 14))
 
-        # Cada vez que cambia el tamaño de la zona se reescala el mapa para llenarla
-        # manteniendo la proporción
-        def ajustar_mapa(evento):
-            ancho_orig, alto_orig = mapa_original.size
-            escala = min(evento.width / ancho_orig, evento.height / alto_orig)
-            tamano = (max(1, int(ancho_orig * escala)), max(1, int(alto_orig * escala)))
-            if getattr(lbl_imagen, "tamano", None) != tamano:
-                lbl_imagen.image = ImageTk.PhotoImage(mapa_original.resize(tamano, Image.LANCZOS))
-                lbl_imagen.configure(image=lbl_imagen.image)
-                lbl_imagen.tamano = tamano
-        zona_mapa.bind("<Configure>", ajustar_mapa)
-    except OSError:
-        tk.Label(zona_mapa, text="Imagen no encontrada\n\nAsegúrate de que 'InvernaliaZonas.jpg'\nestá en el mismo directorio.",
-                 font=(FUENTE, 10), bg=C_TARJETA, fg="#e53935").pack(expand=True)
+    canvas_mapa = tk.Canvas(f_mapa, width=500, height=400, bg="#f5f7fa", highlightthickness=1, highlightbackground=C_BORDE)
+    canvas_mapa.pack()
 
-    tk.Frame(leyenda, bg=C_BORDE, height=1).pack(fill=tk.X, pady=(0, 10))
-    tk.Label(leyenda, text="LEYENDA", font=(FUENTE, 8, "bold"), bg=C_TARJETA,
-             fg=C_TEXTO_SUAVE).pack(anchor="w", pady=(0, 6))
-    filas_leyenda = tk.Frame(leyenda, bg=C_TARJETA)
-    filas_leyenda.pack(fill=tk.X)
-    for i, estado in enumerate(ESTADOS_WS):
-        item = tk.Frame(filas_leyenda, bg=C_TARJETA)
-        item.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 18), pady=2)
-        tk.Label(item, bg=COLOR_ESTADO[estado], width=2, relief="flat",
-                 highlightthickness=1, highlightbackground="#b0bac5").pack(side=tk.LEFT, padx=(0, 6))
-        texto = TEXTO_ESTADO[estado] + (" (parpadea)" if estado == "WATERING" else "")
-        tk.Label(item, text=texto, font=(FUENTE, 9), bg=C_TARJETA, fg=C_TEXTO).pack(side=tk.LEFT)
-
-    # Alterna en cada refresco para que las estaciones regando parpadeen
-    parpadeo = {"encendido": True}
-
-    def actualizar_reloj():
-        lbl_reloj.configure(text=time.strftime("%H:%M:%S"))
-        ventana.after(1000, actualizar_reloj)
-
-    # Función interna para refrescar los datos automáticamente
-    def cargar_datos_bd():
-        parpadeo["encendido"] = not parpadeo["encendido"]
-
+    mapa_img_tk = None
+    for _nmap in ["InvernaliaZonas.jpg", "InvernaliaZonas.png", "mapa.jpg", "mapa.png", "Invernalia.jpg", "Invernalia.png", "mapa.jpeg"]:
         try:
-            conn = sqlite3.connect("database.db")
-            cur = conn.cursor()
-            cur.execute("SELECT ID, Location, Status, Flow, Accum, Operator FROM estaciones")
-            filas = cur.fetchall()
-            conn.close()
+            _pil_m = Image.open(_nmap)
+            _pil_m = _pil_m.resize((500, 400))
+            mapa_img_tk = ImageTk.PhotoImage(_pil_m)
+            break
+        except Exception:
+            pass
 
-            # Las filas se actualizan en su sitio (iid = ID) para no perder la selección
-            for fila in filas:
-                estado = fila[2]
-                fila_limpia = [valor if valor is not None else "—" for valor in fila]
-                fila_limpia[2] = "●  " + TEXTO_ESTADO.get(estado, estado)
-                if fila[3] is not None:
-                    fila_limpia[3] = f"{fila[3]:.2f} l/min"
-                if fila[4] is not None:
-                    fila_limpia[4] = f"{fila[4]:.2f} l"
+    def redibujar_mapa():
+        canvas_mapa.delete("all")
+        if mapa_img_tk:
+            canvas_mapa.create_image(0, 0, image=mapa_img_tk, anchor="nw")
 
-                tag = estado
-                if estado == "WATERING" and not parpadeo["encendido"]:
-                    tag = "WATERING_OFF"
+        with lock_estaciones:
+            for id_est, data in estaciones.items():
+                sec = data.get("sector")
+                est = data.get("estado", "OFFLINE")
+                if sec:
+                    cx, cy = sec
+                    bg_col = COLOR_ESTADO.get(est, "#eceff1")
+                    fg_col = TEXTO_COLOR_ESTADO.get(est, "#1f2933")
+                    canvas_mapa.create_oval(cx - 9, cy - 9, cx + 9, cy + 9, fill=bg_col, outline="#1b2a3a", width=1)
+                    canvas_mapa.create_text(cx, cy, text=id_est, fill=fg_col, font=(FUENTE, 6, "bold"))
 
-                if tabla.exists(fila[0]):
-                    tabla.item(fila[0], values=fila_limpia, tags=(tag,))
-                else:
-                    tabla.insert("", tk.END, iid=fila[0], values=fila_limpia, tags=(tag,))
+    def refrescar_panel():
+        lbl_reloj.config(text=time.strftime("%H:%M:%S"))
 
-            ids = [TODAS] + [fila[0] for fila in filas]
-            if list(combo_estacion["values"]) != ids:
-                combo_estacion["values"] = ids
-
-            # Indicadores
-            lbl_kpis["TOTAL"].configure(text=str(len(filas)))
-            for estado in ESTADOS_WS:
-                lbl_kpis[estado].configure(text=str(sum(1 for fila in filas if fila[2] == estado)))
-            lbl_pie.configure(text=f"Última actualización: {time.strftime('%H:%M:%S')}  ·  Base de datos: database.db")
-        except Exception as e:
-            print(f"[ERROR BD] No se pudieron refrescar los datos: {e}")
-            lbl_pie.configure(text=f"Error al leer la base de datos: {e}")
-
-        # Mensajes nuevos del registro de eventos (la hora en gris y el resto según su tipo)
         while not cola_log.empty():
-            linea = cola_log.get()
-            hora, _, mensaje = linea.partition("  ")
-            texto_log.configure(state=tk.NORMAL)
-            texto_log.insert(tk.END, hora + "  ", "hora")
-            texto_log.insert(tk.END, mensaje + "\n", tipo_log(mensaje))
-            texto_log.see(tk.END)
-            texto_log.configure(state=tk.DISABLED)
+            linea = cola_log.get_nowait()
+            tag = tipo_log(linea)
+            txt_log.insert(tk.END, linea + "\n", tag)
+            txt_log.see(tk.END)
 
-        # Re-ejecutar cada 500 milisegundos (también marca el ritmo del parpadeo)
-        ventana.after(500, cargar_datos_bd)
+        counts = {"TOTAL": 0, "AVAILABLE": 0, "WATERING": 0, "LEAK": 0, "STOPPED": 0, "OFFLINE": 0}
+        with lock_estaciones:
+            items_est = list(estaciones.values())
 
-    # Iniciar la carga de datos y el bucle principal de la interfaz
-    actualizar_reloj()
-    cargar_datos_bd()
+        for e in items_est:
+            counts["TOTAL"] += 1
+            st = e["estado"]
+            if st in counts:
+                counts[st] += 1
+
+        for k, v in counts.items():
+            if k in lbl_kpis:
+                lbl_kpis[k].config(text=str(v))
+
+        for item in tabla.get_children():
+            tabla.delete(item)
+
+        ids_conectados = []
+        for e in items_est:
+            sec_str = f"({e['sector'][0]},{e['sector'][1]})" if e.get("sector") else "-"
+            fl = f"{e.get('flow'):.1f} L/min" if e.get('flow') is not None else "-"
+            ac = f"{e.get('accum')} L" if e.get('accum') is not None else "-"
+            op = e.get('operator') or "-"
+            st = e["estado"]
+            tabla.insert("", tk.END, values=(e["id"], e["ubicacion"], sec_str, TEXTO_ESTADO.get(st, st), fl, ac, op), tags=(st,))
+            if st != "OFFLINE":
+                ids_conectados.append(e["id"])
+
+        combo_estaciones["values"] = [TODAS] + sorted(ids_conectados)
+
+        redibujar_mapa()
+        ventana.after(500, refrescar_panel)
+
+    lbl_pie.config(text="Sistema iniciado correctamente.")
+    refrescar_panel()
     ventana.mainloop()
 
-######################### MAIN ##########################
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2:
-        cargar_estaciones_bd()
-        log(f"[BD] {len(estaciones)} estaciones cargadas de la base de datos (todas en OFFLINE)")
-        mostrar_bd()
-
-        PORT = int(sys.argv[1])
-        SERVER = "0.0.0.0"
-        ADDR = (SERVER, PORT)
-
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(ADDR)
-
-        print(f"[STARTING] Iniciando WM_Central en {SERVER}:{PORT}...")
-        hilo_servidor = threading.Thread(target=start, args=(server, SERVER, PORT), daemon=True)
-        hilo_servidor.start()
-        Pantalla_Monitor()
-    else:
-        print("Uso: python WM_Central.py <puerto_escucha>")
-        print("Ejemplo: python WM_Central.py 9999")
-
-conexion.close()
+    SERVER = socket.gethostbyname(socket.gethostname())
+    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
+    cargar_estaciones_bd()
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind((SERVER, PORT))
+    t_server = threading.Thread(target=start, args=(server_sock, SERVER, PORT), daemon=True)
+    t_server.start()
+    Pantalla_Monitor()
