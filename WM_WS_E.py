@@ -273,8 +273,11 @@ def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID
 
 def mostrar_menu():
     print("Comandos:")
-    print("  R <segundos> = iniciar riego manual   P = parar riego")
-    print("  K = provocar avería (KO)   O = resolver avería (OK)   FIN = salir")
+    print("  R <segundos> = iniciar riego manual\n")
+    print("  P = parar riego\n")
+    print("  K = provocar avería (KO)\n")
+    print("  O = resolver avería (OK)\n")
+    print("  FIN = salir")
 
 
 def main():

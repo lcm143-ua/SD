@@ -346,7 +346,7 @@ def finalizar_riego_bd(id_estacion, volumen, duracion, motivo):
     conexion.close()
     return resumen
 
-########## EVENTOS DE RIEGO QUE ENVIARÁ EL ENGINE (por Kafka) ##########
+########## EVENTOS DE RIEGO QUE ENVIARA EL ENGINE por KAFKA ###
 # Estas funciones las llamará el consumidor de Kafka al recibir los mensajes
 # RIEGO_INICIO, TELEMETRIA y RIEGO_FIN que ya publica (de momento en vacío) WM_WS_E.
 

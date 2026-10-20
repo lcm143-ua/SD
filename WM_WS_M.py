@@ -319,7 +319,7 @@ def main():
     global central
     if len(sys.argv) != 6 or not sys.argv[1].isdigit() or not sys.argv[3].isdigit():
         print("Uso: python WM_WS_M.py <puerto_engine> <ip_central> <puerto_central> <id_ws> <ubicacion>")
-        print('Ejemplo: python WM_WS_M.py 8000 127.0.0.1 9999 WS_01 "Bosque de los Dioses"')
+        print('Ejemplo: python WM_WS_M.py 8000 127.0.0.1 9999 WS_01 "Bosque_Dioses"')
         return
 
     puerto_engine = int(sys.argv[1])
