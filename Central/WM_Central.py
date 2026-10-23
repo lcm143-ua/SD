@@ -1,15 +1,46 @@
 import socket
 import threading
 import sys
+import os
+import json
 import sqlite3
 import queue
 import time
-import tkinter as tk
-from tkinter import ttk
-from PIL import Image, ImageTk   # Tkinter no abre JPG por sí solo (pip install pillow)
+import logging
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from kafka import KafkaProducer, KafkaConsumer   # pip install kafka-python
+from kafka.admin import KafkaAdminClient, NewTopic
+from kafka.errors import TopicAlreadyExistsError
+
+# El panel de escritorio (Tkinter) solo se abre si hay pantalla. En Railway/Docker
+# no la hay: allí se usa únicamente el panel web.
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    from PIL import Image, ImageTk   # Tkinter no abre JPG por sí solo (pip install pillow)
+except ImportError:
+    tk = None
 
 FORMAT = 'utf-8'
 FIN = "FIN"
+
+# Carpeta del programa: la imagen del mapa está aquí aunque se lance desde otro sitio
+CARPETA = os.path.dirname(os.path.abspath(__file__))
+
+# Ruta de la BD. En Railway se apunta a un volumen (WM_DB=/data/database.db)
+# para que no se borre en cada despliegue.
+DB_PATH = os.environ.get("WM_DB", "database.db")
+
+# Kafka (ver los formatos de cada mensaje en las funciones que los envían)
+TOPIC_EVENTOS = "WM_eventos"        # Engine -> Central
+TOPIC_ORDENES = "WM_ordenes"        # Central -> Engine
+TOPIC_PETICIONES = "WM_peticiones"  # FO -> Central
+TOPIC_RESPUESTAS = "WM_respuestas"  # Central -> FO
+TOPICS = (TOPIC_EVENTOS, TOPIC_ORDENES, TOPIC_PETICIONES, TOPIC_RESPUESTAS)
+REINTENTO_KAFKA = 3     # segundos entre intentos de conexión con el broker
+OPERARIO_LOCAL = "LOCAL"    # riego lanzado desde el menú del engine (no hay FO al que avisar)
+logging.getLogger("kafka").setLevel(logging.CRITICAL)
 
 # Protocolo de sockets recomendado en el enunciado: <STX><DATA><ETX><LRC>
 #   - Al conectar, el cliente envía ENQ y el servidor contesta ACK (handshake).
@@ -60,7 +91,7 @@ OPERARIOS_INICIALES = [
     ("FO_03", "Operario 3")
 ]
 
-conexion = sqlite3.connect("database.db")
+conexion = sqlite3.connect(DB_PATH)
 cursor = conexion.cursor()
 
 #Creación de todas las tablas
@@ -115,7 +146,15 @@ lock_estaciones = threading.Lock()
 
 # Mensajes para el registro de eventos del panel. Los hilos de los sockets no pueden
 # tocar la ventana de Tkinter, así que dejan los mensajes en esta cola y el panel los recoge.
+# Solo se llena si hay panel de escritorio (si no, crecería sin que nadie la vacíe).
 cola_log = queue.Queue()
+hay_gui = False
+
+# Últimas líneas del registro para el panel web
+historial_log = deque(maxlen=300)
+
+# Productor de Kafka (None hasta que el broker responde)
+productor = None
 
 ZONAS_SECTORES = {
     "Invernadero": [
@@ -145,7 +184,10 @@ ZONAS_SECTORES = {
 
 def log(mensaje):
     print(mensaje)
-    cola_log.put(f"{time.strftime('%H:%M:%S')}  {mensaje}")
+    linea = f"{time.strftime('%H:%M:%S')}  {mensaje}"
+    historial_log.append(linea)
+    if hay_gui:
+        cola_log.put(linea)
 
 def ahora():
     return time.strftime("%Y-%m-%d %H:%M:%S")
@@ -177,7 +219,7 @@ def asignar_sector(id_estacion, ubicacion, sector_idx=None):
 def cargar_estaciones_bd():
     # Al arrancar no sabemos el estado real de ninguna estación hasta que se
     # conecte, así que todas las registradas pasan a OFFLINE (punto 1 de la mecánica)
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
 
     cursor.execute("""
@@ -215,7 +257,7 @@ def cargar_estaciones_bd():
     conexion.close()
 
 def guardar_estacion_bd(estaciones, id):
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
 
     estacion = estaciones[id]
@@ -244,7 +286,7 @@ def guardar_estacion_bd(estaciones, id):
     conexion.close()
 
 def mostrar_bd():
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
 
     cursor.execute("SELECT * FROM estaciones")
@@ -257,7 +299,7 @@ def mostrar_bd():
     conexion.close()
 
 def modificar_estado(id, estado):
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
 
     cursor.execute("""
@@ -272,7 +314,7 @@ def modificar_estado(id, estado):
 ########## OPERARIOS Y RIEGOS (BD) ##########
 
 def operario_existe(id_operario):
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
     cursor.execute("SELECT ID FROM operarios WHERE ID = ?", (id_operario,))
     existe = cursor.fetchone() is not None
@@ -281,7 +323,7 @@ def operario_existe(id_operario):
 
 def iniciar_riego_bd(id_estacion, id_operario, limite):
     # Se llama cuando el engine confirma que ha abierto la electroválvula (RIEGO_INICIO)
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
     cursor.execute("""
         INSERT INTO riegos (Estacion, Operario, Inicio, Limite)
@@ -297,7 +339,7 @@ def iniciar_riego_bd(id_estacion, id_operario, limite):
 
 def actualizar_telemetria_bd(id_estacion, caudal, volumen):
     # Se llama cada segundo durante el riego (TELEMETRIA)
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
     cursor.execute("""
         UPDATE estaciones
@@ -309,7 +351,7 @@ def actualizar_telemetria_bd(id_estacion, caudal, volumen):
 
 def finalizar_riego_bd(id_estacion, volumen, duracion, motivo):
     # Cierra el riego abierto de la estación y devuelve su resumen (o None si no había)
-    conexion = sqlite3.connect("database.db")
+    conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
     cursor.execute("""
         SELECT ID, Operario, Inicio, Limite FROM riegos
@@ -346,40 +388,166 @@ def finalizar_riego_bd(id_estacion, volumen, duracion, motivo):
     conexion.close()
     return resumen
 
-########## EVENTOS DE RIEGO QUE ENVIARA EL ENGINE por KAFKA ###
-# Estas funciones las llamará el consumidor de Kafka al recibir los mensajes
-# RIEGO_INICIO, TELEMETRIA y RIEGO_FIN que ya publica (de momento en vacío) WM_WS_E.
+########## EVENTOS DE RIEGO QUE ENVÍA EL ENGINE POR KAFKA ##########
+# Las llama escuchar_eventos al recibir RIEGO_INICIO, TELEMETRIA y RIEGO_FIN de WM_WS_E.
+# Además de la BD actualizan el diccionario, que es lo que pinta el panel.
 
 def riego_iniciado(id_estacion, id_operario, limite):
     with lock_estaciones:
-        estaciones[id_estacion]["estado"] = "WATERING"
+        if id_estacion not in estaciones:
+            return
+        estacion = estaciones[id_estacion]
+        estacion["estado"] = "WATERING"
+        estacion["flow"] = 0.0
+        estacion["accum"] = 0.0
+        estacion["operator"] = id_operario
+        bloqueada = estacion["bloqueada"]
         iniciar_riego_bd(id_estacion, id_operario, limite)
     log(f"[RIEGO] '{id_estacion}' empieza a regar. Operario: {id_operario}, límite {limite} s")
+    notificar_operario(id_operario, f"INICIO#{id_operario}#{id_estacion}#{limite}")
+    # Un engine reiniciado no sabe que estaba bloqueado y puede regar a mano: se le recuerda
+    if bloqueada:
+        log(f"[BLOQUEO] '{id_estacion}' está bloqueada: se repite la orden")
+        enviar_orden(id_estacion, f"BLOQUEAR#{id_estacion}")
 
 def telemetria_recibida(id_estacion, caudal, volumen):
-    actualizar_telemetria_bd(id_estacion, caudal, volumen)
-
-def riego_finalizado(id_estacion, volumen, duracion, motivo):
     with lock_estaciones:
+        if id_estacion not in estaciones:
+            return
+        estacion = estaciones[id_estacion]
+        estacion["flow"] = caudal
+        estacion["accum"] = volumen
+        id_operario = estacion.get("operator")
+    actualizar_telemetria_bd(id_estacion, caudal, volumen)
+    # Cada operario solo recibe los datos de la estación que le está regando (punto 10)
+    if id_operario:
+        notificar_operario(id_operario, f"TELEMETRIA#{id_operario}#{id_estacion}#{caudal}#{volumen}")
+
+def riego_finalizado(id_estacion, id_operario, volumen, duracion, motivo):
+    with lock_estaciones:
+        if id_estacion not in estaciones:
+            return None
         estacion = estaciones[id_estacion]
         resumen = finalizar_riego_bd(id_estacion, volumen, duracion, motivo)
+        estacion["flow"] = estacion["accum"] = estacion["operator"] = None
         # Vuelve a reposo salvo que la haya cambiado otro evento (fuga, bloqueo, desconexión)
         if estacion["estado"] == "WATERING":
             estacion["estado"] = "STOPPED" if estacion["bloqueada"] else "AVAILABLE"
             modificar_estado(id_estacion, estacion["estado"])
     log(f"[RIEGO] '{id_estacion}' termina ({motivo}): {volumen} l en {duracion} s")
-    # PENDIENTE KAFKA: enviar el resumen al operario que pidió el riego
+    # Resumen final para el operario que pidió el riego (punto 8)
+    notificar_operario(id_operario, f"RESUMEN#{id_operario}#{id_estacion}#{volumen}#{duracion}#{motivo}")
     return resumen
+
+########## KAFKA ##########
+
+def crear_topics(bootstrap):
+    # Se crean al arrancar para que los consumidores no esperen a que alguien
+    # publique por primera vez (y por si el broker no los crea solo)
+    admin = KafkaAdminClient(bootstrap_servers=bootstrap)
+    for topic in TOPICS:
+        try:
+            admin.create_topics([NewTopic(topic, num_partitions=1, replication_factor=1)])
+        except TopicAlreadyExistsError:
+            pass
+    admin.close()
+
+def conectar_kafka(bootstrap):
+    # La central arranca aunque Kafka no esté: los sockets y el panel funcionan igual
+    # y se reintenta hasta que el broker conteste.
+    global productor
+    while productor is None:
+        try:
+            crear_topics(bootstrap)
+            productor = KafkaProducer(bootstrap_servers=bootstrap, max_block_ms=2000)
+        except Exception:
+            log(f"[KAFKA] ERROR: no se puede conectar con el broker {bootstrap}, reintentando en {REINTENTO_KAFKA}s")
+            time.sleep(REINTENTO_KAFKA)
+    log(f"[KAFKA] Conectado al broker {bootstrap}")
+    threading.Thread(target=escuchar_eventos, args=(bootstrap,), daemon=True).start()
+    threading.Thread(target=escuchar_peticiones, args=(bootstrap,), daemon=True).start()
+
+def publicar(topic, clave, mensaje):
+    if productor is None:
+        log(f"[KAFKA] ERROR: sin conexión con el broker, no se envía {mensaje}")
+        return
+    try:
+        productor.send(topic, key=clave.encode(FORMAT), value=mensaje.encode(FORMAT))
+    except Exception as e:
+        log(f"[KAFKA] ERROR al enviar {mensaje}: {e}")
+
+def notificar_operario(id_operario, mensaje):
+    # Mensajes para WM_FO. Los riegos de la central o del menú del engine no tienen FO.
+    if id_operario not in (OPERARIO_CENTRAL, OPERARIO_LOCAL):
+        publicar(TOPIC_RESPUESTAS, id_operario, mensaje)
+
+def escuchar_eventos(bootstrap):
+    # Eventos de los engines. Sin group_id y con "latest": al reiniciar la central
+    # no se reprocesan eventos viejos (la mecánica ya cierra los riegos abiertos).
+    consumidor = KafkaConsumer(TOPIC_EVENTOS, bootstrap_servers=bootstrap,
+                               group_id=None, auto_offset_reset="latest")
+    for registro in consumidor:
+        msg = registro.value.decode(FORMAT)
+        partes = msg.split('#')
+        try:
+            if partes[0] == "RIEGO_INICIO" and len(partes) == 4:
+                riego_iniciado(partes[1], partes[2], int(partes[3]))
+            elif partes[0] == "TELEMETRIA" and len(partes) == 4:
+                telemetria_recibida(partes[1], float(partes[2]), float(partes[3]))
+            elif partes[0] == "RIEGO_FIN" and len(partes) == 6:
+                riego_finalizado(partes[1], partes[2], float(partes[3]), int(partes[4]), partes[5])
+            elif partes[0] == "RECHAZADO" and len(partes) == 4:
+                id_estacion, id_operario, motivo = partes[1], partes[2], partes[3]
+                log(f"[RIEGO] '{id_estacion}' NO AUTORIZA el riego de {id_operario}: {motivo}")
+                notificar_operario(id_operario, f"DENEGADO#{id_operario}#{id_estacion}#la estación lo rechaza: {motivo}")
+            else:
+                log(f"[KAFKA] Evento no válido: {msg}")
+        except ValueError:
+            log(f"[KAFKA] Evento con datos no válidos: {msg}")
+
+def escuchar_peticiones(bootstrap):
+    # Peticiones de los operarios:
+    #   SOLICITUD#id_operario#id_ws#limite_segundos -> RECIBIDA y luego AUTORIZADO o DENEGADO
+    #   LISTA#id_operario                            -> LISTA#id_operario#WS_01=Disponible;...
+    consumidor = KafkaConsumer(TOPIC_PETICIONES, bootstrap_servers=bootstrap,
+                               group_id=None, auto_offset_reset="latest")
+    for registro in consumidor:
+        msg = registro.value.decode(FORMAT)
+        partes = msg.split('#')
+        if partes[0] == "SOLICITUD" and len(partes) == 4 and partes[3].isdigit() and int(partes[3]) > 0:
+            atender_solicitud(partes[1], partes[2], int(partes[3]))
+        elif partes[0] == "LISTA" and len(partes) == 2:
+            notificar_operario(partes[1], f"LISTA#{partes[1]}#{lista_estaciones()}")
+        else:
+            log(f"[KAFKA] Petición no válida: {msg}")
+
+def atender_solicitud(id_operario, id_estacion, limite):
+    # Cada paso se notifica al operario y se muestra en el panel (punto 4)
+    log(f"[PETICIÓN] {id_operario} pide regar '{id_estacion}' durante {limite} s")
+    notificar_operario(id_operario, f"RECIBIDA#{id_operario}#{id_estacion}")
+    ok, motivo = autorizar_riego(id_estacion, id_operario)
+    if ok:
+        log(f"[RIEGO] Autorizado en '{id_estacion}' para {id_operario} ({limite} s)")
+        notificar_operario(id_operario, f"AUTORIZADO#{id_operario}#{id_estacion}#{limite}")
+        enviar_orden(id_estacion, f"REGAR#{id_estacion}#{id_operario}#{limite}")
+    else:
+        log(f"[RIEGO] Denegado en '{id_estacion}' a {id_operario}: {motivo}")
+        notificar_operario(id_operario, f"DENEGADO#{id_operario}#{id_estacion}#{motivo}")
+
+def lista_estaciones():
+    # Para que los operarios vean qué estaciones hay y cuáles están disponibles
+    with lock_estaciones:
+        return ";".join(f"{e['id']}={TEXTO_ESTADO[e['estado']]}" for e in sorted(estaciones.values(), key=lambda e: e["id"]))
 
 ########## ÓRDENES DE LA CENTRAL (punto 11) ##########
 
 def enviar_orden(id_estacion, orden):
-    # PENDIENTE KAFKA: aquí se publicará la orden para el WM_WS_E de esa estación.
-    # Formatos ya definidos:
+    # Orden para el WM_WS_E de esa estación. Formatos:
     #   REGAR#id_ws#operario#limite_segundos
     #   BLOQUEAR#id_ws
     #   ACTIVAR#id_ws
-    log(f"[ORDEN -> {id_estacion}] {orden}  (envío por Kafka pendiente)")
+    log(f"[ORDEN -> {id_estacion}] {orden}")
+    publicar(TOPIC_ORDENES, id_estacion, orden)
 
 def autorizar_riego(id_estacion, id_operario):
     # Comprobaciones antes de autorizar un riego (punto 4 de la mecánica).
@@ -502,14 +670,18 @@ def desconectar_estacion(id_estacion):
     with lock_estaciones:
         estacion = estaciones[id_estacion]
         estado_anterior = estacion["estado"]
+        id_operario = estacion.get("operator")
         estacion["estado"] = "OFFLINE"
         estacion["conn"] = None
         estacion["addr"] = None
+        estacion["flow"] = estacion["accum"] = estacion["operator"] = None
         modificar_estado(id_estacion, "OFFLINE")
 
     # Si estaba regando, el riego queda cerrado: ya no se puede monitorizar
     if estado_anterior == "WATERING":
         finalizar_riego_bd(id_estacion, None, None, "DESCONEXION")
+        if id_operario:
+            notificar_operario(id_operario, f"RESUMEN#{id_operario}#{id_estacion}#-#-#DESCONEXION")
 
 def calcular_lrc(datos):
     # XOR byte a byte del mensaje
@@ -627,6 +799,9 @@ def atender_mensaje(conn, addr, msg, id_estacion_actual):
             log(f"[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada desde {addr}")
             send_msg(conn, f"ACK#REGISTER_OK#{id_estacion}")
             mostrar_bd()
+            # Si sigue bloqueada, el engine (quizá reiniciado) tiene que saberlo
+            if estaciones[id_estacion]["bloqueada"]:
+                enviar_orden(id_estacion, f"BLOQUEAR#{id_estacion}")
             return id_estacion, True
 
         log(f"[REGISTRO KO] '{id_estacion}' ya está conectada o sector ocupado, se rechaza {addr}")
@@ -983,7 +1158,7 @@ def Pantalla_Monitor():
     mapa_img_tk = None
     for _nmap in ["InvernaliaZonas.jpg", "InvernaliaZonas.png", "mapa.jpg", "mapa.png", "Invernalia.jpg", "Invernalia.png", "mapa.jpeg"]:
         try:
-            _pil_m = Image.open(_nmap)
+            _pil_m = Image.open(os.path.join(CARPETA, _nmap))
             _pil_m = _pil_m.resize((500, 400))
             mapa_img_tk = ImageTk.PhotoImage(_pil_m)
             break
@@ -1036,7 +1211,7 @@ def Pantalla_Monitor():
         for e in items_est:
             sec_str = f"({e['sector'][0]},{e['sector'][1]})" if e.get("sector") else "-"
             fl = f"{e.get('flow'):.1f} L/min" if e.get('flow') is not None else "-"
-            ac = f"{e.get('accum')} L" if e.get('accum') is not None else "-"
+            ac = f"{e.get('accum'):.2f} L" if e.get('accum') is not None else "-"
             op = e.get('operator') or "-"
             st = e["estado"]
             tabla.insert("", tk.END, values=(e["id"], e["ubicacion"], sec_str, TEXTO_ESTADO.get(st, st), fl, ac, op), tags=(st,))
@@ -1053,13 +1228,239 @@ def Pantalla_Monitor():
     ventana.mainloop()
 
 
+########## PANEL WEB ##########
+# En Railway no hay pantalla, así que el panel se sirve también por HTTP.
+# La página pide /api/estado cada segundo y manda las órdenes a /api/orden.
+
+PAGINA_WEB = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WM Central</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; background: #eef1f5; color: #1f2933; }
+  header { background: #1b2a3a; color: #fff; padding: 12px 20px; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header small { color: #9fb3c8; display: block; font-size: 12px; }
+  header .estado { margin-left: auto; font-size: 13px; font-weight: 600; }
+  main { padding: 14px; display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(0, 520px); }
+  @media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .kpis { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+  .kpi, .tarjeta { background: #fff; border: 1px solid #d9dee5; border-radius: 6px; }
+  .kpi { padding: 8px 12px; border-left: 4px solid var(--c); }
+  .kpi b { font-size: 24px; display: block; }
+  .kpi span { font-size: 12px; color: #6b7785; }
+  .tarjeta { padding: 12px 14px; overflow: hidden; }
+  .tarjeta h2 { font-size: 12px; color: #6b7785; margin: 0 0 8px; letter-spacing: .05em; }
+  .columna { display: grid; gap: 14px; align-content: start; min-width: 0; }
+  .tabla { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; font-size: 11px; color: #6b7785; padding: 8px; background: #f5f7fa; }
+  td { padding: 8px; border-top: 1px solid #fff; white-space: nowrap; }
+  .AVAILABLE { background: #c8e6c9; color: #1b5e20; }
+  .WATERING { background: #43a047; color: #fff; animation: parpadeo 1s steps(1) infinite; }
+  .LEAK { background: #e53935; color: #fff; }
+  .STOPPED { background: #ffcc80; color: #4e2a00; }
+  .OFFLINE { background: #eceff1; color: #5f6b76; }
+  @keyframes parpadeo { 50% { background: #e8f5e9; color: #1b5e20; } }
+  .controles { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  select, input, button { font: inherit; padding: 6px 10px; border: 1px solid #d9dee5; border-radius: 4px; }
+  input { width: 90px; }
+  button { color: #fff; border: 0; font-weight: 600; cursor: pointer; }
+  .regar { background: #2e7d32; } .bloquear { background: #ef6c00; } .activar { background: #1e88e5; }
+  #log { background: #1e2836; color: #d8dee9; font: 12px Consolas, monospace; height: 260px; overflow-y: auto; padding: 8px; white-space: pre-wrap; margin: 0; }
+  .error { color: #ff6b6b; } .aviso { color: #ffb454; } .ok { color: #7ed491; } .info { color: #7fb8ff; }
+  #mapa { position: relative; width: 500px; max-width: 100%; aspect-ratio: 5 / 4; background: #f5f7fa url(/mapa) 0 0 / 100% 100%; border: 1px solid #d9dee5; }
+  .punto { position: absolute; width: 20px; height: 20px; margin: -10px 0 0 -10px; border-radius: 50%; border: 1px solid #1b2a3a; font: bold 6px sans-serif; display: flex; align-items: center; justify-content: center; }
+</style></head>
+<body>
+<header><span style="font-size:24px">&#128167;</span>
+  <div><h1>WM Central</h1><small>Monitor de Estaciones de Riego &middot; Invernalia</small></div>
+  <span class="estado" id="estado">Conectando...</span></header>
+<main>
+  <section class="kpis" id="kpis"></section>
+  <div class="columna">
+    <div class="tarjeta"><h2>ESTADO DE LAS ESTACIONES</h2><div class="tabla"><table>
+      <thead><tr><th>ID</th><th>UBICACIÓN</th><th>SECTOR</th><th>ESTADO</th><th>CAUDAL</th><th>ACUMULADO</th><th>OPERARIO</th></tr></thead>
+      <tbody id="filas"></tbody></table></div></div>
+    <div class="tarjeta"><h2>ACCIONES DE CONTROL</h2><div class="controles">
+      <label>Estación <select id="destino"><option>TODAS</option></select></label>
+      <label>Límite (s) <input id="limite" type="number" min="1" value="60"></label>
+      <button class="regar" onclick="orden('REGAR')">REGAR</button>
+      <button class="bloquear" onclick="orden('BLOQUEAR')">BLOQUEAR</button>
+      <button class="activar" onclick="orden('ACTIVAR')">ACTIVAR</button></div></div>
+    <div class="tarjeta"><h2>REGISTRO DE EVENTOS</h2><pre id="log"></pre></div>
+  </div>
+  <div class="columna"><div class="tarjeta"><h2>MAPA DE SECTORES</h2><div id="mapa"></div></div></div>
+</main>
+<script>
+const KPIS = [["TOTAL", "Estaciones", "#1e88e5"], ["AVAILABLE", "Disponible", "#43a047"], ["WATERING", "Regando", "#2e7d32"],
+              ["LEAK", "Fuga", "#e53935"], ["STOPPED", "Fuera de Servicio", "#fb8c00"], ["OFFLINE", "Desconectada", "#9e9e9e"]];
+
+function celda(fila, texto) { const td = document.createElement("td"); td.textContent = texto; fila.appendChild(td); }
+
+function tipoLog(l) {
+  const t = l.toUpperCase();
+  if (["KO]", "AVERÍA", "FUGA", "ERROR", "DENEG", "NO SE PUEDE", "NO AUTORIZ"].some(p => t.includes(p))) return "error";
+  if (["[BLOQUEO]", "[DESCONEXION]", "[LATIDO]", "OFFLINE"].some(p => t.includes(p))) return "aviso";
+  if (["[RIEGO]", "[ACTIVAR]", "REGISTRO OK"].some(p => t.includes(p))) return "ok";
+  if (["[ORDEN", "[ESTADO]", "[KAFKA]", "[PETICIÓN]"].some(p => t.includes(p))) return "info";
+  return "";
+}
+
+let ultimoLog = "";
+async function refrescar() {
+  try {
+    const d = await (await fetch("/api/estado")).json();
+    document.getElementById("estado").textContent = "● En servicio · sockets " + d.puerto + (d.kafka ? " · Kafka OK" : " · Kafka sin conexión");
+    const cuenta = {TOTAL: d.estaciones.length};
+    d.estaciones.forEach(e => cuenta[e.estado] = (cuenta[e.estado] || 0) + 1);
+    document.getElementById("kpis").innerHTML = KPIS.map(([k, t, c]) =>
+      `<div class="kpi" style="--c:${c}"><b>${cuenta[k] || 0}</b><span>${t}</span></div>`).join("");
+
+    const filas = document.getElementById("filas"), mapa = document.getElementById("mapa");
+    filas.textContent = ""; mapa.textContent = "";
+    const destino = document.getElementById("destino"), elegido = destino.value;
+    destino.length = 1;
+    d.estaciones.forEach(e => {
+      const tr = document.createElement("tr"); tr.className = e.estado;
+      celda(tr, e.id); celda(tr, e.ubicacion); celda(tr, e.sector ? "(" + e.sector + ")" : "-"); celda(tr, e.texto);
+      celda(tr, e.flow == null ? "-" : e.flow.toFixed(1) + " L/min");
+      celda(tr, e.accum == null ? "-" : e.accum.toFixed(2) + " L");
+      celda(tr, e.operator || "-");
+      filas.appendChild(tr);
+      if (e.estado != "OFFLINE") destino.add(new Option(e.id));
+      if (e.sector) {
+        const p = document.createElement("div"); p.className = "punto " + e.estado; p.textContent = e.id;
+        p.style.left = e.sector[0] / 5 + "%"; p.style.top = e.sector[1] / 4 + "%";
+        mapa.appendChild(p);
+      }
+    });
+    destino.value = [...destino.options].some(o => o.value == elegido) ? elegido : "TODAS";
+
+    const log = document.getElementById("log"), texto = d.log.join("\\n");
+    if (texto != ultimoLog) {
+      ultimoLog = texto; log.textContent = "";
+      d.log.forEach(l => { const s = document.createElement("span"); s.className = tipoLog(l); s.textContent = l + "\\n"; log.appendChild(s); });
+      log.scrollTop = log.scrollHeight;
+    }
+  } catch (err) {
+    document.getElementById("estado").textContent = "Sin conexión con la central";
+  }
+}
+
+async function orden(accion) {
+  await fetch("/api/orden", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({accion: accion, estacion: document.getElementById("destino").value,
+                          limite: parseInt(document.getElementById("limite").value)})});
+  refrescar();
+}
+
+refrescar();
+setInterval(refrescar, 1000);
+</script>
+</body></html>
+"""
+
+def buscar_mapa():
+    # Mismos nombres que el panel de escritorio; el PNG va primero porque pesa menos
+    for nombre in ("InvernaliaZonas.png", "InvernaliaZonas.jpg"):
+        ruta = os.path.join(CARPETA, nombre)
+        if os.path.exists(ruta):
+            return ruta
+    return None
+
+class PanelWeb(BaseHTTPRequestHandler):
+    def responder(self, codigo, tipo, cuerpo):
+        self.send_response(codigo)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+    def do_GET(self):
+        if self.path == "/":
+            self.responder(200, "text/html; charset=utf-8", PAGINA_WEB.encode(FORMAT))
+        elif self.path == "/api/estado":
+            with lock_estaciones:
+                lista = [{
+                    "id": e["id"], "ubicacion": e["ubicacion"], "sector": e.get("sector"),
+                    "estado": e["estado"], "texto": TEXTO_ESTADO.get(e["estado"], e["estado"]),
+                    "flow": e.get("flow"), "accum": e.get("accum"), "operator": e.get("operator")
+                } for e in sorted(estaciones.values(), key=lambda e: e["id"])]
+            datos = {"puerto": PORT, "kafka": productor is not None, "estaciones": lista, "log": list(historial_log)}
+            self.responder(200, "application/json", json.dumps(datos).encode(FORMAT))
+        elif self.path == "/mapa" and buscar_mapa():
+            ruta = buscar_mapa()
+            with open(ruta, "rb") as f:
+                tipo = "image/png" if ruta.endswith(".png") else "image/jpeg"
+                self.responder(200, tipo, f.read())
+        else:
+            self.responder(404, "text/plain", b"No encontrado")
+
+    def do_POST(self):
+        if self.path != "/api/orden":
+            self.responder(404, "text/plain", b"No encontrado")
+            return
+        try:
+            datos = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            accion, destino = datos["accion"], datos["estacion"]
+            with lock_estaciones:
+                existe = destino == TODAS or destino in estaciones
+            if not existe:
+                raise ValueError(f"estación desconocida {destino}")
+            if accion == "REGAR":
+                limite = int(datos["limite"])
+                if limite <= 0:
+                    raise ValueError("el límite tiene que ser positivo")
+                aplicar_orden(destino, orden_iniciar_riego, limite)
+            elif accion == "BLOQUEAR":
+                aplicar_orden(destino, orden_bloquear)
+            elif accion == "ACTIVAR":
+                aplicar_orden(destino, orden_activar)
+            else:
+                raise ValueError(f"acción desconocida {accion}")
+            self.responder(200, "application/json", b'{"ok": true}')
+        except (ValueError, KeyError, TypeError) as e:
+            self.responder(400, "application/json", json.dumps({"ok": False, "error": str(e)}).encode(FORMAT))
+
+    def log_message(self, *args):
+        pass    # sin una línea por cada petición (la página refresca cada segundo)
+
+
 if __name__ == "__main__":
-    SERVER = socket.gethostbyname(socket.gethostname())
-    PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
+    if len(sys.argv) != 4 or not sys.argv[1].isdigit() or not sys.argv[3].isdigit():
+        print("Uso: python WM_Central.py <puerto_sockets> <ip_broker> <puerto_broker>")
+        print("Ejemplo: python WM_Central.py 5050 127.0.0.1 9092")
+        print("El panel web escucha en la variable de entorno PORT (8080 si no existe)")
+        sys.exit(1)
+
+    # 0.0.0.0: se aceptan conexiones por cualquier interfaz (necesario en Docker/Railway)
+    SERVER = "0.0.0.0"
+    PORT = int(sys.argv[1])
+    bootstrap = f"{sys.argv[2]}:{sys.argv[3]}"
+    PUERTO_WEB = int(os.environ.get("PORT", 8080))
+
+    # Panel de escritorio solo si hay Tkinter y pantalla (WM_GUI=0 lo desactiva)
+    if tk is not None and os.environ.get("WM_GUI", "1") != "0":
+        try:
+            tk.Tk().destroy()
+            hay_gui = True
+        except tk.TclError:
+            pass
+
     cargar_estaciones_bd()
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((SERVER, PORT))
     t_server = threading.Thread(target=start, args=(server_sock, SERVER, PORT), daemon=True)
     t_server.start()
-    Pantalla_Monitor()
+    threading.Thread(target=conectar_kafka, args=(bootstrap,), daemon=True).start()
+
+    panel_web = ThreadingHTTPServer(("0.0.0.0", PUERTO_WEB), PanelWeb)
+    log(f"[PANEL] Panel web en http://localhost:{PUERTO_WEB}")
+    if hay_gui:
+        threading.Thread(target=panel_web.serve_forever, daemon=True).start()
+        Pantalla_Monitor()
+    else:
+        panel_web.serve_forever()

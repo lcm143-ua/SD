@@ -4,6 +4,8 @@ import sys
 import threading
 import time
 import random
+import logging
+from kafka import KafkaProducer, KafkaConsumer   # pip install kafka-python
 
 FORMAT = 'utf-8'
 FIN = "FIN"
@@ -39,12 +41,26 @@ FIN_TIEMPO = "TIEMPO"       # se alcanzó el límite de tiempo
 FIN_MANUAL = "MANUAL"       # comando P en el menú de la estación
 FIN_FUGA = "FUGA"           # avería durante el riego
 FIN_APAGADO = "APAGADO"     # el engine se apaga con FIN
-FIN_BLOQUEO = "BLOQUEO"     # orden BLOQUEAR de la central (llegará por Kafka)
+FIN_BLOQUEO = "BLOQUEO"     # orden BLOQUEAR de la central (llega por Kafka)
+
+# Kafka: el engine publica sus eventos de riego y escucha las órdenes de la central
+TOPIC_EVENTOS = "WM_eventos"    # Engine -> Central: RIEGO_INICIO, TELEMETRIA, RIEGO_FIN, RECHAZADO
+TOPIC_ORDENES = "WM_ordenes"    # Central -> Engine: REGAR, BLOQUEAR, ACTIVAR
+REINTENTO_KAFKA = 3             # segundos entre intentos de conexión con el broker
+
+# kafka-python escribe sus propios avisos en la consola y taparían el menú
+logging.getLogger("kafka").setLevel(logging.CRITICAL)
 
 # Estado de salud que se responde al monitor. Lo cambia el teclado (hilo principal)
 # y lo lee el hilo del monitor; es una simple asignación, no hace falta lock.
 estado_engine = OK
 id_ws = None
+
+# Productor de Kafka (None hasta que el broker responde)
+productor = None
+
+# Orden BLOQUEAR de la central: mientras dure no se puede regar, ni siquiera a mano
+bloqueada = False
 
 # Riego en curso (None si la electroválvula está cerrada). Lo usan el hilo del
 # teclado y el hilo del riego, así que se protege con un lock.
@@ -154,23 +170,86 @@ def despedirse(sock):
     sock.close()
 
 
+########## KAFKA ##########
+
+def conectar_kafka(bootstrap):
+    # El broker puede no estar listo todavía: se reintenta hasta que conteste.
+    # Después kafka-python se reconecta solo si el broker se cae un rato.
+    global productor
+    while productor is None:
+        try:
+            # max_block_ms: si el broker cae, send no se queda bloqueado 60 s (por defecto)
+            productor = KafkaProducer(bootstrap_servers=bootstrap, max_block_ms=2000)
+        except Exception:
+            print(f"\n[KAFKA] No se puede conectar con el broker {bootstrap}, reintentando en {REINTENTO_KAFKA}s")
+            time.sleep(REINTENTO_KAFKA)
+    print(f"\n[KAFKA] Conectado al broker {bootstrap}")
+    escuchar_ordenes(bootstrap)
+
+
 def publicar_evento(mensaje):
-    # PENDIENTE KAFKA: aquí se publicará el mensaje para WM_Central (y el operario).
-    # Formatos ya definidos:
+    # Publica un evento de riego para WM_Central (que se lo reenvía al operario).
+    # Formatos:
     #   RIEGO_INICIO#id_ws#operario#limite_segundos
     #   TELEMETRIA#id_ws#caudal#volumen_acumulado
     #   RIEGO_FIN#id_ws#operario#volumen_total#duracion#motivo
-    # De momento el riego solo se muestra en la pantalla del engine.
-    pass
+    #   RECHAZADO#id_ws#operario#motivo   (orden REGAR que la estación no puede cumplir)
+    # La clave es el ID de la estación: así sus eventos van siempre en orden.
+    if productor is None:
+        print(f"[KAFKA] Sin conexión con el broker, no se publica: {mensaje}")
+        return
+    try:
+        productor.send(TOPIC_EVENTOS, key=id_ws.encode(FORMAT), value=mensaje.encode(FORMAT))
+    except Exception as e:
+        print(f"[KAFKA] No se ha podido publicar '{mensaje}': {e}")
 
+
+def escuchar_ordenes(bootstrap):
+    # Recibe las órdenes de la central. Todas las estaciones leen el mismo topic
+    # y cada engine se queda solo con las que llevan su ID.
+    # Sin group_id y con "latest": al arrancar no se ejecutan órdenes antiguas.
+    consumidor = KafkaConsumer(TOPIC_ORDENES, bootstrap_servers=bootstrap,
+                               group_id=None, auto_offset_reset="latest")
+    for registro in consumidor:
+        partes = registro.value.decode(FORMAT).split('#')
+        if len(partes) >= 2 and partes[1] == id_ws:
+            atender_orden(partes)
+
+
+def atender_orden(partes):
+    global bloqueada
+    orden = partes[0]
+    print(f"\n[CENTRAL] Orden recibida: {'#'.join(partes)}")
+
+    if orden == "REGAR" and len(partes) == 4 and partes[3].isdigit():
+        operario = partes[2]
+        ok, motivo = iniciar_riego(operario, int(partes[3]))
+        if not ok:
+            print(f"[RIEGO] No se puede regar: {motivo}")
+            publicar_evento(f"RECHAZADO#{id_ws}#{operario}#{motivo}")
+    elif orden == "BLOQUEAR":
+        bloqueada = True
+        print("[BLOQUEO] Estación FUERA DE SERVICIO por orden de la central")
+        if parar_riego(FIN_BLOQUEO):
+            print("[BLOQUEO] Riego en curso cortado")
+    elif orden == "ACTIVAR":
+        bloqueada = False
+        print("[ACTIVAR] Estación activada de nuevo por la central")
+    else:
+        print("[CENTRAL] Orden desconocida, se ignora")
+
+
+########## RIEGO ##########
 
 def iniciar_riego(operario, limite):
     # Abre la electroválvula si la estación puede regar. Devuelve (ok, motivo).
-    # La usa el menú local y la usará la orden REGAR que llegue de la central.
+    # La usan el menú local y la orden REGAR que llega de la central.
     global riego
     with lock_riego:
         if id_ws is None:
             return False, "la estación aún no está autenticada (sin ID del monitor)"
+        if bloqueada:
+            return False, "la estación está fuera de servicio (bloqueada por la central)"
         if estado_engine == KO:
             return False, "hay una avería (fuga) detectada"
         if riego is not None:
@@ -287,22 +366,26 @@ def main():
         print("Uso: python WM_WS_E.py <ip_broker> <puerto_broker> <ip_monitor> <puerto_monitor>")
         print("Ejemplo: python WM_WS_E.py 127.0.0.1 9092 127.0.0.1 8000")
     else:
-        # Los datos del broker se usarán cuando se añada Kafka
         ip_broker = sys.argv[1]
         puerto_broker = int(sys.argv[2])
         ip_monitor = sys.argv[3]
         puerto_monitor = int(sys.argv[4])
         addr_monitor = (ip_monitor, puerto_monitor)
 
-        # Hilo que habla con el monitor. daemon=True para que muera con FIN.
+        # Hilos del monitor y de Kafka. daemon=True para que mueran con FIN.
         hilo_monitor = threading.Thread(target=atender_monitor, args=(addr_monitor,), daemon=True)
         hilo_monitor.start()
+        hilo_kafka = threading.Thread(target=conectar_kafka, args=(f"{ip_broker}:{puerto_broker}",), daemon=True)
+        hilo_kafka.start()
 
         # El hilo principal se queda leyendo el teclado
         mostrar_menu()
         salir = False
         while not salir:
-            partes = input().strip().split()
+            try:
+                partes = input().strip().split()
+            except EOFError:    # sin teclado (p. ej. docker sin -it): se apaga como con FIN
+                partes = [FIN]
             comando = partes[0].upper() if partes else ""
 
             if comando == "K":
@@ -329,6 +412,8 @@ def main():
                     r = riego
                 if parar_riego(FIN_APAGADO):
                     r["hilo"].join(2)   # deja que se muestre el resumen antes de salir
+                if productor is not None:
+                    productor.flush(5)  # que el RIEGO_FIN llegue a la central antes de salir
                 print("[DESCONEXIÓN] Apagando engine.")
                 salir = True
             elif comando:

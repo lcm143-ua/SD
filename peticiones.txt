@@ -1,0 +1,5 @@
+// Peticiones de prueba para WM_FO: una por línea, id_estacion#segundos
+// Tras cada una (con éxito o no) se esperan 4 segundos antes de la siguiente
+WS_01#10
+WS_02#15
+WS_03#10
