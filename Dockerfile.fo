@@ -1,0 +1,11 @@
+# Field Operator
+#   docker build -f Dockerfile.fo -t wm-fo .
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY WM_FO.py peticiones.txt ./
+ENV PYTHONUNBUFFERED=1
+
+# Sin argumentos muestra el uso
+CMD ["python", "WM_FO.py"]

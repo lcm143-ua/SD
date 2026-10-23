@@ -1,0 +1,7 @@
+.git
+Memoria
+*.pdf
+__pycache__
+**/__pycache__
+**/database.db
+Central/InvernaliaZonas.jpg
