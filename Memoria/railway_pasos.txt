@@ -1,0 +1,95 @@
+Paso 1 – Crear el proyecto local
+Crea una carpeta nueva, por ejemplo railway-hello-world, y ábrela en VS Code (File → Open Folder).
+Crea el archivo server.py. Copia el código con la sangría bien puesta, porque al copiarlo del PDF se pierde:
+
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+port = int(os.environ.get("PORT", 3000))
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Hello World desde Railway!")
+
+print(f"Escuchando en el puerto {port}")
+HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+Crea el archivo Dockerfile, sin extensión y con la D mayúscula:
+
+FROM python:3.12-alpine
+WORKDIR /app
+COPY . .
+EXPOSE 3000
+CMD ["python", "server.py"]
+(Opcional, recomendado) Pruébalo en local con python server.py y abre http://localhost:3000. Debería salir el mensaje. Para pararlo, pulsa Ctrl+C.
+Paso 2 – Subirlo a GitHub desde VS Code
+Abre el panel Source Control con Ctrl+Shift+G.
+Pulsa Initialize Repository.
+Escribe el mensaje Hello World inicial y pulsa Commit. Si VS Code pregunta por los cambios "staged", responde Yes / Always.
+Pulsa Publish Branch → Publish to GitHub, elige público o privado y ponle el nombre railway-hello-world.
+La primera vez te pedirá iniciar sesión en GitHub desde el navegador.
+Comprueba en github.com que el repo existe y contiene los dos archivos.
+⚠️ El PDF escribe el nombre de dos formas: railway-helloworld en un sitio y railway-hello-world en otro. Da igual cuál uses, pero usa el mismo nombre en los dos pasos.
+
+Paso 3 – Conectar Railway al repo
+En railway.app ve a New Project → Deploy from GitHub repo.
+La primera vez, pulsa Configure GitHub App y dale acceso al repo, o a todos tus repos.
+Selecciona railway-hello-world. Railway detecta el Dockerfile y empieza el build. Puedes ver los logs en la pestaña Deployments → View logs.
+Cuando termine, entra en el servicio → Settings → Networking → Generate Domain.
+Si te pide un puerto, pon el que salga en los logs (Escuchando en el puerto XXXX). Normalmente Railway lo detecta solo.
+Abre la URL https://railway-hello-world-production.up.railway.app (o la que te genere). Debe mostrar "Hello World desde Railway!".
+Paso 4 – Probar el ciclo CI/CD
+En server.py cambia el texto, por ejemplo a b"Hello World desde Railway! - Borja".
+En Source Control escribe un mensaje, pulsa Commit y luego Sync Changes, que es lo que hace el push.
+En Railway, en la pestaña Deployments, debería aparecer un build nuevo sin que toques nada.
+Cuando termine (estado Active / Success), recarga la URL y comprueba que sale el texto nuevo. ✅
+Parte 2: Kafka en Railway con acceso remoto
+Paso 5 – Desplegar Kafka
+Dentro del mismo proyecto, pulsa + New (o Create) → Template y busca Kafka.
+Elige la plantilla de apache/kafka en modo KRaft, la que funciona sin ZooKeeper.
+Pulsa Deploy. Railway crea el servicio y un volumen persistente. Espera a que esté en verde.
+Paso 6 – Exponerlo con TCP Proxy
+Entra en el servicio Kafka → Settings → Networking → TCP Proxy → + Add.
+Pon el puerto interno 9092.
+Apunta el host y el puerto que te asigna, del tipo xxxxx.proxy.rlwy.net:19097.
+⚠️ Esta es la trampa más habitual con Kafka. El broker devuelve a los clientes la dirección configurada en KAFKA_ADVERTISED_LISTENERS. Si esa dirección es la interna (*.railway.internal), tu PC conecta al principio y luego falla con timeouts o con NoBrokersAvailable.
+
+Para evitarlo, revisa en la pestaña Variables del servicio Kafka que el listener externo anuncie el host:puerto del TCP Proxy. Muchas plantillas ya lo hacen con RAILWAY_TCP_PROXY_DOMAIN y RAILWAY_TCP_PROXY_PORT. Si cambias alguna variable, Railway redespliega el servicio.
+
+Paso 7 – Probarlo desde tu PC con Python
+En una terminal ejecuta:
+
+pip install kafka-python
+Crea test_kafka.py y cambia BOOTSTRAP por tu host:puerto real:
+
+from kafka import KafkaProducer, KafkaConsumer
+
+BOOTSTRAP = "xxxxx.proxy.rlwy.net:19097"  # <-- el tuyo
+
+producer = KafkaProducer(bootstrap_servers=BOOTSTRAP)
+producer.send("topic-prueba", b"Hola desde un equipo remoto")
+producer.flush()
+print("Mensaje enviado.")
+
+consumer = KafkaConsumer(
+    "topic-prueba",
+    bootstrap_servers=BOOTSTRAP,
+    auto_offset_reset="earliest",
+    consumer_timeout_ms=5000
+)
+for msg in consumer:
+    print("Recibido:", msg.value.decode())
+Ejecútalo con python test_kafka.py. Si funciona, verás Mensaje enviado. y después Recibido: Hola desde un equipo remoto. ✅
+Si da error de versión con Python 3.12 o posterior, prueba pip install kafka-python-ng.
+Paso 8 – Comprobación alternativa (opcional)
+Si tienes los binarios de Kafka descargados, lista los topics. Debe salir topic-prueba y ningún error de conexión.
+
+En Linux/Mac:
+
+kafka-topics.sh --bootstrap-server xxxxx.proxy.rlwy.net:19097 --list
+En Windows, usa bin\windows\kafka-topics.bat con los mismos argumentos.
+Consejo: el plan gratuito o de prueba de Railway tiene un crédito limitado. Cuando termines de probar, puedes pausar o borrar el servicio Hello World y dejar solo Kafka para la práctica Water_Management.
+
+Si quieres, te creo los archivos server.py, Dockerfile y test_kafka.py en una carpeta para que solo tengas que publicarla desde VS Code.
