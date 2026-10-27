@@ -12,11 +12,4 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"Hello World desde Railway!") 
         
 print(f"Escuchando en el puerto {port}") 
-HTTPServer(("0.0.0.0", port), Handler).serve_forever() 
-
-# Dockerfile 
-FROM python:3.12-alpine 
-WORKDIR /app 
-COPY . . 
-EXPOSE 3000 
-CMD ["python", "server.py"] 
+HTTPServer(("0.0.0.0", port), Handler).serve_forever()

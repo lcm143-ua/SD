@@ -208,8 +208,7 @@ def escuchar_ordenes(bootstrap):
     # Recibe las órdenes de la central. Todas las estaciones leen el mismo topic
     # y cada engine se queda solo con las que llevan su ID.
     # Sin group_id y con "latest": al arrancar no se ejecutan órdenes antiguas.
-    consumidor = KafkaConsumer(TOPIC_ORDENES, bootstrap_servers=bootstrap,
-                               group_id=None, auto_offset_reset="latest")
+    consumidor = KafkaConsumer(TOPIC_ORDENES, bootstrap_servers=bootstrap,group_id=None, auto_offset_reset="latest")
     for registro in consumidor:
         partes = registro.value.decode(FORMAT).split('#')
         if len(partes) >= 2 and partes[1] == id_ws:
