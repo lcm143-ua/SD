@@ -1,0 +1,119 @@
+**** DESPLIEGUE, MODULARIDAD Y ESCALABILIDAD ****
+- La estructura del repo no es la que piden. 
+La guía exige las carpetas WM_Central/, WM_WS/, WM_FO/ y prompts/, 
+y los ficheros Readme.md y Nombres.txt. Ahora tenéis Central/, 
+los demás .py sueltos en la raíz, ni prompts/ ni Nombres.txt, 
+y el README solo tiene los nombres.
+
+- El repo no está en la organización UA_SD. Está en lcm143-ua/SD. 
+Tenéis que moverlo allí o crearlo dentro y dar acceso al profesor.
+
+- Hay basura en el repo: server.py (el hello world de Railway), 
+los __pycache__/*.pyc, Central/database.db y el PDF del enunciado. 
+Además server.py y WM_WS_E.py tienen cambios sin commitear.
+
+- Escalabilidad limitada por los sectores. 
+Cada ubicación tiene un número fijo de huecos (Invernadero tiene 2, Cripta 4…). 
+Si el profesor pide una tercera WS en Invernadero, se rechaza (WM_Central.py:636-638). 
+Tenedlo claro para explicarlo o cambiadlo.
+
+- No puedo comprobar si Kafka y la central están desplegados de verdad en Railway. 
+El día de la corrección tienen que estar ya funcionando.
+
+
+**** FUNCIONAMIENTO BASE ****
+
+- "En ningún caso se puede perder ninguna transacción." 
+Todos los consumidores Kafka usan group_id=None y auto_offset_reset="latest". 
+Cualquier mensaje publicado mientras un módulo está caído se pierde: 
+RIEGO_FIN que llega con la central caída, órdenes para un engine reiniciado, 
+respuestas para un FO cerrado. Se arregla con group_id fijo por módulo 
+(por ejemplo central o FO_01) y commit de offsets.
+
+- Registro y autenticación. La central da de alta automáticamente cualquier 
+ID nuevo que llegue con REGISTER, así que nunca contesta "WS no registrada". 
+El enunciado permite el alta, pero la guía pone de ejemplo una denegación por 
+WS no registrada. Lo mínimo es tener la denegación por ID duplicado o sector 
+ocupado (ya la tenéis) y saber justificarlo. Lo ideal es separar el alta de la autenticación.
+
+- "Out of Service". Mostráis "Fuera de Servicio", que es lo que dice el enunciado; 
+la guía dice "Out of Service". Seguramente vale, pero si queréis ir a lo seguro, 
+poned ese texto.
+
+- En el panel Tkinter el riego no parpadea. Existe el color WATERING_OFF pero nunca 
+se alterna (WM_Central.py:1217). En el panel web sí parpadea.
+
+- "Cantidad de agua suministrada". Solo se ve durante el riego; al terminar vuelve a "-". 
+Si lo que piden es un total histórico por WS, no lo mostráis.
+
+- Telemetría en el panel. Después de una fuga o una desconexión, caudal y 
+operario se quedan con valores viejos en el diccionario de la central.
+
+**** RESILENCIA ****
+- Cae el monitor y el riego no se para. La guía dice que el riego debe terminar 
+(salvo que el engine también haya caído) y que la WS no debe aceptar más riegos, 
+ni manuales, mostrando "Averiada". Ahora el engine sigue regando y permite R manual: 
+bucle_riego solo mira estado_engine == KO, e iniciar_riego no comprueba si hay monitor. 
+Mientras tanto la central sigue recibiendo telemetría de una WS que muestra como desconectada.
+
+- Cae el engine durante un riego y el FO no se entera. Al pasar de WATERING a LEAK, 
+la central solo escribe en el log (cambiar_estado_monitor). No cierra el riego 
+ni avisa al FO, y como el engine ha muerto, nunca llega un RIEGO_FIN.
+
+- El engine no guarda lo regado. El riego solo existe en memoria. La guía pide que 
+no se pierda lo ya regado y que, al recuperarse, el engine envíe el estado final. 
+Hace falta guardarlo en un fichero local (por ejemplo riego_WS_01.json) cada segundo y,
+ al arrancar, enviar el RIEGO_FIN pendiente.
+
+- El FO no ve el resultado al volver. Por el latest sin group_id, el RESUMEN se pierde. 
+Opciones: group_id=FO_xx, o que el FO pida al arrancar su último riego a la central 
+(ya lo tenéis en la tabla riegos).
+
+- Con la central caída se siguen admitiendo riegos. El engine acepta R manual porque 
+no sabe que la central ha caído (eso solo lo sabe el monitor).
+
+- Al volver la central se pierden riegos. cargar_estaciones_bd cierra los riegos 
+abiertos como REINICIO_CENTRAL y los RIEGO_FIN publicados mientras estaba caída se pierden.
+ Además el monitor se registra de nuevo como AVAILABLE aunque el engine esté regando, 
+ así que la central podría autorizar otro riego en esa WS.
+
+- El FO no muestra "Imposible conectar con WM_Central". El FO solo habla con Kafka. 
+Si la central está caída, una petición manual R se queda esperando sin ningún mensaje; 
+solo el modo fichero tiene un timeout de 10 s. Hace falta un timeout también en R, 
+o un latido de la central por Kafka para detectar que no está. El engine tampoco muestra
+ nada cuando la central cae.
+
+- Un engine reiniciado no sabe que estaba bloqueado. La central solo repite BLOQUEAR 
+cuando el monitor se registra o cuando empieza un riego, así que el engine podría 
+empezar un riego manual y cortarse enseguida.
+
+**** GENERAL ****
+
+- Prompts de IA en el repo. Es obligatorio y, si no están, puede suponer el suspenso.
+
+- Interfaces de monitor, engine y FO. Son consola pura, con los mensajes mezclados 
+con el input(). La guía pide un "interfaz adecuado en todas las aplicaciones".
+
+- Extra de resiliencia (dos centrales o dos brokers). No lo tenéis; es opcional.
+
+- La guía en papel. Hay que llevarla impresa a doble cara y rellenada en la columna "E.".
+
+------------------------------------------------------------------------
+>>>>>>>>>>>>>> Prioridades, por orden de impacto en la nota <<<<<<<<<<<<
+------------------------------------------------------------------------
+Estructura del repo en UA_SD, con prompts/, Nombres.txt, README de verdad y sin la basura. 
+Es lo más rápido y bloquea el apartado de despliegue.
+
+Consumidores Kafka con group_id (central, cada engine con su ID, cada FO con su ID). 
+Resuelve de golpe "no perder transacciones", "el FO ve el resultado al volver" y los 
+RIEGO_FIN perdidos con la central caída.
+
+Que el engine detecte que ha perdido el monitor: cortar el riego, rechazar R y mostrar 
+"Averiada".
+
+Que la central cierre el riego y avise al FO cuando una WS pasa a LEAK o se desconecta
+en mitad de un riego.
+
+Que el engine guarde el riego en curso en disco y envíe el resultado al reiniciarse.
+
+Timeout en el FO (y aviso en el engine) que muestre "Imposible conectar con WM_Central".
