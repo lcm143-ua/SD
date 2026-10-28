@@ -13,8 +13,11 @@ FIN = "FIN"
 TOPIC_PETICIONES = "WM_peticiones"  # FO -> Central: SOLICITUD, LISTA
 TOPIC_RESPUESTAS = "WM_respuestas"  # Central -> FO
 REINTENTO_KAFKA = 3         # segundos entre intentos de conexión con el broker
+TIMEOUT_CENTRAL = 5         # segundos sin respuesta a una petición = la central no está
 TIMEOUT_RESPUESTA = 10      # segundos sin noticias de un riego del fichero = se da por fallido
 ESPERA_FICHERO = 4          # segundos entre una petición del fichero y la siguiente (enunciado)
+SESION_KAFKA_MS = 6000      # tiempo máximo para que el broker dé por muerta una sesión anterior del FO
+SIN_CENTRAL = "Imposible conectar con WM_Central"
 
 # Mensajes que cierran una petición (con éxito o sin él)
 FINALES = ("DENEGADO", "RESUMEN")
@@ -28,6 +31,10 @@ consumidor_listo = threading.Event()
 # El hilo de Kafka deja aquí los mensajes para el que está procesando el fichero
 cola_fichero = queue.Queue()
 procesando_fichero = threading.Event()
+
+# Se activa con cualquier mensaje de la central para este operario. Si tras una
+# petición no se activa en TIMEOUT_CENTRAL segundos, la central no está.
+respuesta_central = threading.Event()
 
 
 ########## KAFKA ##########
@@ -44,45 +51,70 @@ def conectar_kafka(bootstrap):
 
 
 def escuchar_respuestas(bootstrap):
-    # Todos los FO leen el mismo topic y cada uno se queda con los que llevan su ID
+    # Todos los FO leen el mismo topic y cada uno se queda con los que llevan su ID.
+    # Cada FO tiene su grupo (WM_FO_FO_01) y confirma (commit) lo que ya ha mostrado:
+    # si el FO se cierra a mitad de un riego, al volver recibe el RESUMEN pendiente.
     consumidor = None
     while consumidor is None:
         try:
             consumidor = KafkaConsumer(TOPIC_RESPUESTAS, bootstrap_servers=bootstrap,
-                                       group_id=None, auto_offset_reset="latest")
+                                       group_id=f"WM_FO_{id_operario}", auto_offset_reset="latest",
+                                       enable_auto_commit=False, session_timeout_ms=SESION_KAFKA_MS,
+                                       heartbeat_interval_ms=SESION_KAFKA_MS // 3)
         except Exception:
             time.sleep(REINTENTO_KAFKA)
 
     # Hay que tener asignada la partición antes de pedir nada: si no, con "latest"
-    # se perderían las respuestas que lleguen mientras tanto
-    avisado = False
+    # se perderían las respuestas que lleguen mientras tanto.
+    # poll puede devolver ya mensajes pendientes: se muestran, no se descartan.
+    # Unirse al grupo tarda un par de segundos: solo se avisa si tarda más de 5.
+    intentos = 0
     while not consumidor.assignment():
-        consumidor.poll(timeout_ms=1000)
-        if not consumidor.assignment() and not avisado:
+        for registros in consumidor.poll(timeout_ms=1000).values():
+            for registro in registros:
+                atender_registro(registro)
+        intentos += 1
+        if not consumidor.assignment() and intentos == 5:
             print(f"[KAFKA] Esperando al topic {TOPIC_RESPUESTAS} (¿está arrancada la central?)")
-            avisado = True
     for particion in consumidor.assignment():
         consumidor.position(particion)
+    consumidor.commit()
     consumidor_listo.set()
 
     for registro in consumidor:
-        partes = registro.value.decode(FORMAT).split('#')
-        if len(partes) >= 3 and partes[1] == id_operario:
-            mostrar_respuesta(partes)
-            if procesando_fichero.is_set():
-                cola_fichero.put(partes)
+        atender_registro(registro)
+        consumidor.commit()
 
 
-def enviar(mensaje):
+def atender_registro(registro):
+    partes = registro.value.decode(FORMAT).split('#')
+    if len(partes) >= 3 and partes[1] == id_operario:
+        respuesta_central.set()
+        mostrar_respuesta(partes)
+        if procesando_fichero.is_set():
+            cola_fichero.put(partes)
+
+
+def vigilar_central():
+    # Tras una petición manual: si la central no contesta nada, se avisa al operario
+    if not respuesta_central.wait(TIMEOUT_CENTRAL):
+        print(f"[CENTRAL] {SIN_CENTRAL} (sin respuesta en {TIMEOUT_CENTRAL} s)")
+
+
+def enviar(mensaje, vigilar=False):
+    # vigilar=True: petición manual, se avisa si la central no contesta
     if productor is None or not consumidor_listo.is_set():
         print("[KAFKA] Todavía no hay conexión con el broker, prueba en unos segundos")
         return False
+    respuesta_central.clear()
     try:
         productor.send(TOPIC_PETICIONES, key=id_operario.encode(FORMAT), value=mensaje.encode(FORMAT))
         productor.flush(5)
     except Exception as e:
         print(f"[KAFKA] No se ha podido enviar la petición: {e}")
         return False
+    if vigilar:
+        threading.Thread(target=vigilar_central, daemon=True).start()
     return True
 
 
@@ -116,20 +148,25 @@ def mostrar_respuesta(partes):
 
 ########## PETICIONES ##########
 
-def solicitar_riego(id_ws, segundos):
+def solicitar_riego(id_ws, segundos, vigilar=False):
     print(f"[PETICIÓN] Riego en {id_ws} durante {segundos} s")
-    return enviar(f"SOLICITUD#{id_operario}#{id_ws}#{segundos}")
+    return enviar(f"SOLICITUD#{id_operario}#{id_ws}#{segundos}", vigilar)
 
 
 def esperar_fin(id_ws):
     # Espera a que la petición termine (DENEGADO o RESUMEN). Si la central o la
     # estación dejan de dar noticias durante TIMEOUT_RESPUESTA segundos, se da por fallida.
+    contesto = False
     while True:
         try:
             partes = cola_fichero.get(timeout=TIMEOUT_RESPUESTA)
         except queue.Empty:
-            print(f"[{id_ws}] Sin noticias en {TIMEOUT_RESPUESTA}s, se da la petición por fallida")
+            if contesto:
+                print(f"[{id_ws}] Sin noticias en {TIMEOUT_RESPUESTA}s, se da la petición por fallida")
+            else:
+                print(f"[{id_ws}] {SIN_CENTRAL}, se da la petición por fallida")
             return
+        contesto = True
         if partes[2] == id_ws and partes[0] in FINALES:
             return
 
@@ -216,9 +253,9 @@ def main():
             if len(partes) != 3 or not partes[2].isdigit() or int(partes[2]) <= 0 or '#' in partes[1]:
                 print("Uso: R <id_estacion> <segundos>   (ejemplo: R WS_01 30)")
             else:
-                solicitar_riego(partes[1], int(partes[2]))
+                solicitar_riego(partes[1], int(partes[2]), vigilar=True)
         elif comando == "L":
-            enviar(f"LISTA#{id_operario}")
+            enviar(f"LISTA#{id_operario}", vigilar=True)
         elif comando == "F":
             if len(partes) != 2:
                 print("Uso: F <fichero>")
