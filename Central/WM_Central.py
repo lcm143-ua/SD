@@ -68,7 +68,7 @@ MAX_TRAMA = 1024        # bytes de DATA como máximo; más largo se considera ba
 
 TIMEOUT_MONITOR = 10    # segundos sin recibir nada de un monitor (envía PING cada 2 s) = desconectado
 
-# Disponible, Regando, Fuga, Fuera de servicio, Desconectada
+# Disponible, Regando, Fuga, Out of Service, Desconectada
 ESTADOS_WS = ("AVAILABLE", "WATERING", "LEAK", "STOPPED", "OFFLINE")
 
 # Texto y color con que se muestra cada estado en el panel
@@ -76,7 +76,7 @@ TEXTO_ESTADO = {
     "AVAILABLE": "Disponible",
     "WATERING": "Regando",
     "LEAK": "Fuga",
-    "STOPPED": "Fuera de Servicio",
+    "STOPPED": "Out of Service",
     "OFFLINE": "Desconectada"
 }
 COLOR_ESTADO = {
@@ -675,7 +675,7 @@ def orden_iniciar_riego(id_estacion, limite, id_operario=OPERARIO_CENTRAL):
     return ok
 
 def orden_bloquear(id_estacion):
-    # La WS termina cualquier riego y pasa a Fuera de Servicio (naranja)
+    # La WS termina cualquier riego y pasa a Out of Service (naranja)
     with lock_estaciones:
         estacion = estaciones[id_estacion]
         if estacion["estado"] == "OFFLINE":
@@ -686,7 +686,7 @@ def orden_bloquear(id_estacion):
         if estacion["estado"] in ("AVAILABLE", "WATERING"):
             estacion["estado"] = "STOPPED"
             modificar_estado(id_estacion, "STOPPED")
-    log(f"[BLOQUEO] '{id_estacion}' bloqueada (Fuera de Servicio)")
+    log(f"[BLOQUEO] '{id_estacion}' bloqueada (Out of Service)")
     enviar_orden(id_estacion, f"BLOQUEAR#{id_estacion}")
     return True
 
@@ -749,7 +749,7 @@ def cambiar_estado_monitor(id_estacion, nuevo_estado):
     # Aplica un ESTADO enviado por el monitor. Devuelve el estado con que queda.
     with lock_estaciones:
         estacion = estaciones[id_estacion]
-        # Al resolverse una fuga, una estación bloqueada vuelve a Fuera de Servicio
+        # Al resolverse una fuga, una estación bloqueada vuelve a Out of Service
         if nuevo_estado == "AVAILABLE" and estacion["bloqueada"]:
             nuevo_estado = "STOPPED"
         estado_anterior = estacion["estado"]
@@ -1400,7 +1400,7 @@ PAGINA_WEB = """<!doctype html>
 </main>
 <script>
 const KPIS = [["TOTAL", "Estaciones", "#1e88e5"], ["AVAILABLE", "Disponible", "#43a047"], ["WATERING", "Regando", "#2e7d32"],
-              ["LEAK", "Fuga", "#e53935"], ["STOPPED", "Fuera de Servicio", "#fb8c00"], ["OFFLINE", "Desconectada", "#9e9e9e"]];
+              ["LEAK", "Fuga", "#e53935"], ["STOPPED", "Out of Service", "#fb8c00"], ["OFFLINE", "Desconectada", "#9e9e9e"]];
 
 function celda(fila, texto) { const td = document.createElement("td"); td.textContent = texto; fila.appendChild(td); }
 

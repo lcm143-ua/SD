@@ -266,7 +266,7 @@ def atender_orden(partes):
             publicar_evento(f"RECHAZADO#{id_ws}#{operario}#{motivo}")
     elif orden == "BLOQUEAR":
         bloqueada = True
-        print("[BLOQUEO] Estación FUERA DE SERVICIO por orden de la central")
+        print("[BLOQUEO] Estación OUT OF SERVICE (fuera de servicio) por orden de la central")
         if parar_riego(FIN_BLOQUEO):
             print("[BLOQUEO] Riego en curso cortado")
     elif orden == "ACTIVAR":
