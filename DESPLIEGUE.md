@@ -97,9 +97,50 @@ Menú: `R <estacion> <segundos>`, `L` (estado de las estaciones), `F <fichero>`,
 Fichero de peticiones (`peticiones.txt`): una por línea con el formato `id_estacion#segundos`;
 las líneas que empiezan por `//` se ignoran. Tras cada petición (con éxito o no) espera 4 s.
 
-## 3. Pruebas en local (sin Railway ni Docker)
+## 3. Prueba en el aula (sin Railway): 1 PC central + 2 PCs
 
-Kafka local en `localhost:9092` (ver "ARRANCAR KAFKA") y un terminal por módulo:
+| PC | Qué arranca |
+|---|---|
+| PC A (el nuestro) | Kafka + WM_Central (panel Tkinter y web) |
+| PC B | WS_01 y WS_02 (monitor + engine de cada una) y FO_01 |
+| PC C | WS_03 y WS_04 y FO_02 (con `peticiones.txt`) |
+
+En todos: `pip install -r requirements.txt` y el repositorio actualizado (`git pull`).
+`IP_A` es la IPv4 del PC A en la red del aula (`ipconfig`).
+
+### 3.1 PC A
+1. Abrir el firewall de Windows (PowerShell como administrador, una sola vez):
+   ```
+   netsh advfirewall firewall add rule name="WM Kafka" dir=in action=allow protocol=TCP localport=9092
+   netsh advfirewall firewall add rule name="WM Central" dir=in action=allow protocol=TCP localport=5050,8080
+   ```
+2. Kafka (deja la ventana abierta):
+   ```
+   ParteKafka\arrancar_kafka.bat IP_A
+   ```
+   El script anuncia `IP_A:9092` a los clientes. Con el `localhost` de `server.properties` los otros
+   PCs conectan pero luego dan timeout. Además evita los dos fallos de Kafka en Windows 11
+   (el `wmic` que ya no existe y el cierre del broker al borrar segmentos viejos).
+   **No borrar topics** con Kafka en Windows: también tumba el broker.
+3. Central: `python Central/WM_Central.py 5050 IP_A 9092`
+
+### 3.2 PCs B y C
+1. Comprobar Kafka antes de nada: `python ParteKafka/prueba_kafka.py IP_A 9092` (tiene que terminar en `[OK]`).
+2. Un terminal por proceso. El engine va en el mismo PC que su monitor (`127.0.0.1`) y cada WS usa
+   un puerto de engine distinto:
+   ```
+   python WM_WS_M.py 8001 IP_A 5050 WS_01 Bosque_Dioses
+   python WM_WS_E.py IP_A 9092 127.0.0.1 8001
+   python WM_WS_M.py 8002 IP_A 5050 WS_02 Patio_Armas
+   python WM_WS_E.py IP_A 9092 127.0.0.1 8002
+   python WM_FO.py IP_A 9092 FO_01
+   ```
+   Cada engine guarda su riego en curso en `riego_WS_xx.json` en la carpeta desde la que se lanza:
+   para probar la caída del engine hay que volver a lanzarlo desde la misma carpeta.
+
+## 4. Pruebas en local (sin Railway ni Docker)
+
+Kafka local con `ParteKafka\arrancar_kafka.bat localhost` y un terminal por módulo:
 
 ```
 python Central/WM_Central.py 5050 localhost 9092
