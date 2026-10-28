@@ -30,6 +30,8 @@ MAX_TRAMA = 1024        # bytes de DATA como máximo; más largo se considera ba
 HEALTH = "HEALTH"       # pregunta del monitor cada segundo, a la que el engine responde con OK o KO según su estado de salud
 OK = "OK"               # todo funciona
 KO = "KO"               # avería simulada (fuga)
+CENTRAL = "CENTRAL"     # CENTRAL#OK / CENTRAL#KO: el monitor nos dice si tiene conexión con la central
+SIN_CENTRAL = "Imposible conectar con WM_Central"
 REINTENTO_MONITOR = 3   # segundos entre intentos de conexión al monitor
 TIMEOUT_MONITOR = 5     # segundos sin recibir nada del monitor = monitor caído (envía HEALTH cada segundo)
 
@@ -71,6 +73,10 @@ id_asignado = threading.Event()     # el consumidor de órdenes necesita el ID p
 # Sin monitor la estación está AVERIADA: no se puede regar (ni a mano) y el riego
 # en curso se corta, porque nadie vigila si hay fugas
 monitor_conectado = False
+
+# Con la central caída no se aceptan riegos nuevos (tampoco manuales); el que
+# esté en curso sigue hasta terminar. Solo lo sabe el monitor, que nos lo avisa.
+central_conectada = True
 
 # Productor de Kafka (None hasta que el broker responde)
 productor = None
@@ -287,6 +293,8 @@ def iniciar_riego(operario, limite):
             return False, "la estación aún no está autenticada (sin ID del monitor)"
         if not monitor_conectado:
             return False, "la estación está AVERIADA (sin conexión con el monitor)"
+        if not central_conectada:
+            return False, SIN_CENTRAL
         if bloqueada:
             return False, "la estación está fuera de servicio (bloqueada por la central)"
         if estado_engine == KO:
@@ -384,7 +392,7 @@ def recuperar_riego_pendiente():
 def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID y responde a cada HEALTH
     # Se conecta al monitor y responde a cada HEALTH con el estado actual.
     # Si el monitor se cae, vuelve a intentarlo cada REINTENTO_MONITOR segundos.
-    global id_ws, monitor_conectado
+    global id_ws, monitor_conectado, central_conectada
     while True:
         try:
             # El timeout queda puesto en el socket: si el monitor deja de enviar
@@ -414,6 +422,13 @@ def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID
                 id_ws = mensaje.split('#')[1]
                 print(f"[MONITOR] ID asignado a este engine: {id_ws}")
                 id_asignado.set()
+            elif mensaje.startswith(f"{CENTRAL}#"):
+                conectada = mensaje.split('#')[1] == OK
+                if conectada and not central_conectada:
+                    print("\n[CENTRAL] Conexión con WM_Central restablecida: se aceptan riegos")
+                elif not conectada and central_conectada:
+                    print(f"\n[CENTRAL] {SIN_CENTRAL}: no se aceptan riegos nuevos (el que esté en curso sigue)")
+                central_conectada = conectada
             elif mensaje == HEALTH:
                 try:
                     send(conn, estado_engine) # estado de saludo del engine

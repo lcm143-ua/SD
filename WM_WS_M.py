@@ -25,6 +25,8 @@ MAX_TRAMA = 1024        # bytes de DATA como máximo; más largo se considera ba
 HEALTH = "HEALTH"       # el monitor lo envía cada segundo
 OK = "OK"               # respuesta del engine si todo va bien
 KO = "KO"               # respuesta del engine si detecta avería (fuga)
+CENTRAL = "CENTRAL"     # CENTRAL#OK / CENTRAL#KO: el monitor avisa al engine si hay conexión con la central
+                        # (el engine solo habla con la central por Kafka y no puede saberlo)
 INTERVALO_HEALTH = 1    # segundos entre HEALTH
 TIMEOUT_ENGINE = 3      # segundos sin respuesta (o sin conexión) del engine = avería
 
@@ -259,6 +261,7 @@ def cambiar_estado(id_ws, nuevo_estado):
 def vigilar_engine(conn_engine, id_ws): # vigila la salud del engine (KO o silencio = fuga)
     conn_engine.settimeout(TIMEOUT_ENGINE)
     conectado = True
+    central_avisada = None      # último estado de la central que se le ha dicho a este engine
 
     # Lo primero: handshake y decirle al engine qué ID tiene (ya validado por la central)
     try:
@@ -272,6 +275,12 @@ def vigilar_engine(conn_engine, id_ws): # vigila la salud del engine (KO o silen
 
     while conectado:
         try:
+            # Si ha cambiado la conexión con la central (o es un engine recién
+            # conectado) se le avisa antes del HEALTH
+            central_ok = OK if central is not None else KO
+            if central_ok != central_avisada:
+                send(conn_engine, f"{CENTRAL}#{central_ok}")
+                central_avisada = central_ok
             send(conn_engine, HEALTH)
             respuesta = receive(conn_engine)
         except OSError:  # incluye socket.timeout y conexión reseteada
