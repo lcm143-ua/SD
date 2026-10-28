@@ -1,6 +1,8 @@
 # SIMULA el hardware de la estacióno de riego. Se conecta al monitor y responde a cada HEALTH con el estado de salud.
 import socket
 import sys
+import os
+import json
 import threading
 import time
 import random
@@ -42,11 +44,20 @@ FIN_MANUAL = "MANUAL"       # comando P en el menú de la estación
 FIN_FUGA = "FUGA"           # avería durante el riego
 FIN_APAGADO = "APAGADO"     # el engine se apaga con FIN
 FIN_BLOQUEO = "BLOQUEO"     # orden BLOQUEAR de la central (llega por Kafka)
+FIN_SIN_MONITOR = "SIN_MONITOR"     # se ha perdido el monitor: la estación queda averiada
+FIN_CAIDA_ENGINE = "CAIDA_ENGINE"   # el engine se cayó regando; se envía al volver a arrancar
 
 # Kafka: el engine publica sus eventos de riego y escucha las órdenes de la central
 TOPIC_EVENTOS = "WM_eventos"    # Engine -> Central: RIEGO_INICIO, TELEMETRIA, RIEGO_FIN, RECHAZADO
 TOPIC_ORDENES = "WM_ordenes"    # Central -> Engine: REGAR, BLOQUEAR, ACTIVAR
 REINTENTO_KAFKA = 3             # segundos entre intentos de conexión con el broker
+# Si el engine se reinicia, el broker tarda como mucho esto en dar por muerta la
+# sesión anterior del grupo y repartirle la partición a la nueva
+SESION_KAFKA_MS = 6000
+
+# Fichero donde se guarda el riego en curso cada segundo (riego_WS_01.json):
+# si el engine se cae regando, al volver envía el RIEGO_FIN con lo que se llegó a regar
+FICHERO_RIEGO = "riego_{}.json"
 
 # kafka-python escribe sus propios avisos en la consola y taparían el menú
 logging.getLogger("kafka").setLevel(logging.CRITICAL)
@@ -55,6 +66,11 @@ logging.getLogger("kafka").setLevel(logging.CRITICAL)
 # y lo lee el hilo del monitor; es una simple asignación, no hace falta lock.
 estado_engine = OK
 id_ws = None
+id_asignado = threading.Event()     # el consumidor de órdenes necesita el ID para su grupo
+
+# Sin monitor la estación está AVERIADA: no se puede regar (ni a mano) y el riego
+# en curso se corta, porque nadie vigila si hay fugas
+monitor_conectado = False
 
 # Productor de Kafka (None hasta que el broker responde)
 productor = None
@@ -187,7 +203,7 @@ def conectar_kafka(bootstrap):
     escuchar_ordenes(bootstrap)
 
 
-def publicar_evento(mensaje):
+def publicar_evento(mensaje, confirmar=False):
     # Publica un evento de riego para WM_Central (que se lo reenvía al operario).
     # Formatos:
     #   RIEGO_INICIO#id_ws#operario#limite_segundos
@@ -195,24 +211,46 @@ def publicar_evento(mensaje):
     #   RIEGO_FIN#id_ws#operario#volumen_total#duracion#motivo
     #   RECHAZADO#id_ws#operario#motivo   (orden REGAR que la estación no puede cumplir)
     # La clave es el ID de la estación: así sus eventos van siempre en orden.
+    # Con confirmar=True se espera a que el broker lo guarde (para el RIEGO_FIN,
+    # que no se puede perder). Devuelve True si se ha publicado.
     if productor is None:
         print(f"[KAFKA] Sin conexión con el broker, no se publica: {mensaje}")
-        return
+        return False
     try:
-        productor.send(TOPIC_EVENTOS, key=id_ws.encode(FORMAT), value=mensaje.encode(FORMAT))
+        envio = productor.send(TOPIC_EVENTOS, key=id_ws.encode(FORMAT), value=mensaje.encode(FORMAT))
+        if confirmar:
+            envio.get(timeout=5)
     except Exception as e:
         print(f"[KAFKA] No se ha podido publicar '{mensaje}': {e}")
+        return False
+    return True
 
 
 def escuchar_ordenes(bootstrap):
     # Recibe las órdenes de la central. Todas las estaciones leen el mismo topic
     # y cada engine se queda solo con las que llevan su ID.
-    # Sin group_id y con "latest": al arrancar no se ejecutan órdenes antiguas.
-    consumidor = KafkaConsumer(TOPIC_ORDENES, bootstrap_servers=bootstrap,group_id=None, auto_offset_reset="latest")
+    # Cada engine tiene su propio grupo (WM_engine_WS_01) y confirma (commit) cada
+    # orden después de atenderla: si el engine está caído, las órdenes le esperan
+    # en Kafka y las recibe al volver. "latest" solo se usa la primera vez que
+    # arranca ese grupo, para no ejecutar órdenes de otras pruebas.
+    id_asignado.wait()
+    recuperar_riego_pendiente()
+
+    consumidor = None
+    while consumidor is None:
+        try:
+            consumidor = KafkaConsumer(TOPIC_ORDENES, bootstrap_servers=bootstrap,
+                                       group_id=f"WM_engine_{id_ws}", auto_offset_reset="latest",
+                                       enable_auto_commit=False, session_timeout_ms=SESION_KAFKA_MS,
+                                       heartbeat_interval_ms=SESION_KAFKA_MS // 3)
+        except Exception:
+            time.sleep(REINTENTO_KAFKA)
+
     for registro in consumidor:
         partes = registro.value.decode(FORMAT).split('#')
         if len(partes) >= 2 and partes[1] == id_ws:
             atender_orden(partes)
+        consumidor.commit()
 
 
 def atender_orden(partes):
@@ -247,6 +285,8 @@ def iniciar_riego(operario, limite):
     with lock_riego:
         if id_ws is None:
             return False, "la estación aún no está autenticada (sin ID del monitor)"
+        if not monitor_conectado:
+            return False, "la estación está AVERIADA (sin conexión con el monitor)"
         if bloqueada:
             return False, "la estación está fuera de servicio (bloqueada por la central)"
         if estado_engine == KO:
@@ -284,6 +324,8 @@ def bucle_riego(r): # Solo existe mientras se riega: mie el caudal cada segundo 
         with lock_riego:
             if r["motivo_fin"] is None and estado_engine == KO:
                 r["motivo_fin"] = FIN_FUGA
+            if r["motivo_fin"] is None and not monitor_conectado:
+                r["motivo_fin"] = FIN_SIN_MONITOR
 
             if r["motivo_fin"] is None:
                 r["caudal"] = round(random.uniform(CAUDAL_MIN, CAUDAL_MAX), 2)
@@ -291,6 +333,7 @@ def bucle_riego(r): # Solo existe mientras se riega: mie el caudal cada segundo 
                 transcurrido = time.time() - r["inicio"]
                 print(f"[RIEGO] Caudal: {r['caudal']:.2f} l/min | Acumulado: {r['volumen']:.2f} l | {int(transcurrido)}/{r['limite']} s")
                 publicar_evento(f"TELEMETRIA#{id_ws}#{r['caudal']:.2f}#{r['volumen']:.2f}")
+                guardar_riego(r, int(transcurrido))
                 if transcurrido >= r["limite"]:
                     r["motivo_fin"] = FIN_TIEMPO
 
@@ -302,13 +345,46 @@ def bucle_riego(r): # Solo existe mientras se riega: mie el caudal cada segundo 
 
     print(f"\n[RIEGO] Electroválvula CERRADA. Motivo: {r['motivo_fin']}")
     print(f"[RESUMEN] Operario: {r['operario']} | Volumen total: {r['volumen']:.2f} l | Duración: {duracion} s")
-    publicar_evento(f"RIEGO_FIN#{id_ws}#{r['operario']}#{r['volumen']:.2f}#{duracion}#{r['motivo_fin']}")
+    # Solo se borra el fichero si el broker ha recibido el RIEGO_FIN: si no, se
+    # reenvía cuando el engine vuelva a arrancar
+    if publicar_evento(f"RIEGO_FIN#{id_ws}#{r['operario']}#{r['volumen']:.2f}#{duracion}#{r['motivo_fin']}", confirmar=True):
+        borrar_riego()
+
+
+def guardar_riego(r, duracion):
+    # Lo regado hasta ahora, por si el engine se cae a mitad del riego
+    try:
+        with open(FICHERO_RIEGO.format(id_ws), "w", encoding=FORMAT) as f:
+            json.dump({"operario": r["operario"], "volumen": round(r["volumen"], 2), "duracion": duracion}, f)
+    except OSError as e:
+        print(f"[RIEGO] No se puede guardar el riego en disco: {e}")
+
+
+def borrar_riego():
+    try:
+        os.remove(FICHERO_RIEGO.format(id_ws))
+    except OSError:
+        pass
+
+
+def recuperar_riego_pendiente():
+    # Al arrancar: si hay un riego guardado es que el engine se cayó regando (o que
+    # no pudo enviar el RIEGO_FIN). Se envía ahora con lo que se llegó a regar.
+    try:
+        with open(FICHERO_RIEGO.format(id_ws), encoding=FORMAT) as f:
+            r = json.load(f)
+    except (OSError, ValueError):
+        return
+    print(f"\n[RIEGO] Riego interrumpido por una caída del engine: {r['volumen']:.2f} l en {r['duracion']} s. Se informa a la central")
+    while not publicar_evento(f"RIEGO_FIN#{id_ws}#{r['operario']}#{r['volumen']:.2f}#{r['duracion']}#{FIN_CAIDA_ENGINE}", confirmar=True):
+        time.sleep(REINTENTO_KAFKA)
+    borrar_riego()
 
 
 def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID y responde a cada HEALTH
     # Se conecta al monitor y responde a cada HEALTH con el estado actual.
     # Si el monitor se cae, vuelve a intentarlo cada REINTENTO_MONITOR segundos.
-    global id_ws
+    global id_ws, monitor_conectado
     while True:
         try:
             # El timeout queda puesto en el socket: si el monitor deja de enviar
@@ -321,6 +397,7 @@ def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID
             continue
 
         print(f"\n[MONITOR] Conectado al monitor en {addr_monitor}")
+        monitor_conectado = True
         conectado = True
         while conectado:
             try:
@@ -336,6 +413,7 @@ def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID
             elif mensaje.startswith("ID#"):
                 id_ws = mensaje.split('#')[1]
                 print(f"[MONITOR] ID asignado a este engine: {id_ws}")
+                id_asignado.set()
             elif mensaje == HEALTH:
                 try:
                     send(conn, estado_engine) # estado de saludo del engine
@@ -345,7 +423,11 @@ def atender_monitor(addr_monitor): # habla por sockets con WM_WS_M, recibe el ID
                 print(f"\n[MONITOR] Mensaje desconocido: {mensaje}")
 
         despedirse(conn)
-        print(f"\n[MONITOR] Conexión con el monitor perdida, reintentando en {REINTENTO_MONITOR}s")
+        monitor_conectado = False
+        print("\n[ESTADO] Estación AVERIADA: sin monitor no se aceptan riegos")
+        if parar_riego(FIN_SIN_MONITOR):
+            print("[AVERÍA] Riego en curso cortado: nadie vigila la estación")
+        print(f"[MONITOR] Conexión con el monitor perdida, reintentando en {REINTENTO_MONITOR}s")
         time.sleep(REINTENTO_MONITOR)
 
 
@@ -410,7 +492,7 @@ def main():
                 with lock_riego:
                     r = riego
                 if parar_riego(FIN_APAGADO):
-                    r["hilo"].join(2)   # deja que se muestre el resumen antes de salir
+                    r["hilo"].join(6)   # deja que se envíe el RIEGO_FIN y se borre el fichero antes de salir
                 if productor is not None:
                     productor.flush(5)  # que el RIEGO_FIN llegue a la central antes de salir
                 print("[DESCONEXIÓN] Apagando engine.")
