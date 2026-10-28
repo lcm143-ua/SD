@@ -9,7 +9,7 @@ import time
 import logging
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from kafka import KafkaProducer, KafkaConsumer   # pip install kafka-python
+from kafka import KafkaProducer, KafkaConsumer, TopicPartition   # pip install kafka-python
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
 
@@ -39,7 +39,16 @@ TOPIC_PETICIONES = "WM_peticiones"  # FO -> Central
 TOPIC_RESPUESTAS = "WM_respuestas"  # Central -> FO
 TOPICS = (TOPIC_EVENTOS, TOPIC_ORDENES, TOPIC_PETICIONES, TOPIC_RESPUESTAS)
 REINTENTO_KAFKA = 3     # segundos entre intentos de conexión con el broker
+# Si la central se reinicia, el broker tarda como mucho esto en dar por muerta la
+# sesión anterior del grupo y repartirle las particiones a la nueva
+SESION_KAFKA_MS = 6000
 OPERARIO_LOCAL = "LOCAL"    # riego lanzado desde el menú del engine (no hay FO al que avisar)
+
+# Si una WS pasa a fuga o se desconecta regando, se espera este tiempo al RIEGO_FIN
+# del engine. Si no llega (el engine ha muerto) la central cierra el riego con lo
+# último que sabe y avisa al operario. Si el RIEGO_FIN llega después, lo corrige.
+ESPERA_RIEGO_FIN = 5
+CIERRES_PROVISIONALES = ("AVERIA", "DESCONEXION")
 logging.getLogger("kafka").setLevel(logging.CRITICAL)
 
 # Protocolo de sockets recomendado en el enunciado: <STX><DATA><ETX><LRC>
@@ -226,13 +235,8 @@ def cargar_estaciones_bd():
         UPDATE estaciones
         SET Status = 'OFFLINE', Flow = NULL, Accum = NULL, Operator = NULL
     """)
-
-    # Los riegos que quedaron abiertos cuando se apagó la central se cierran
-    cursor.execute("""
-        UPDATE riegos
-        SET Fin = ?, Motivo = 'REINICIO_CENTRAL'
-        WHERE Fin IS NULL
-    """, (ahora(),))
+    # Los riegos que quedaron abiertos NO se cierran aquí: su RIEGO_FIN sigue en
+    # Kafka esperando a la central (grupo WM_Central) y los cerrará con los datos reales
     conexion.commit()
 
     cursor.execute("SELECT ID, Location, Sector FROM estaciones")
@@ -325,6 +329,12 @@ def iniciar_riego_bd(id_estacion, id_operario, limite):
     # Se llama cuando el engine confirma que ha abierto la electroválvula (RIEGO_INICIO)
     conexion = sqlite3.connect(DB_PATH)
     cursor = conexion.cursor()
+    # Un riego anterior de esta estación que nunca recibió su fin ya no va a llegar
+    cursor.execute("""
+        UPDATE riegos
+        SET Fin = ?, Motivo = 'SIN_CIERRE'
+        WHERE Estacion = ? AND Fin IS NULL
+    """, (ahora(), id_estacion))
     cursor.execute("""
         INSERT INTO riegos (Estacion, Operario, Inicio, Limite)
         VALUES (?, ?, ?, ?)
@@ -388,6 +398,34 @@ def finalizar_riego_bd(id_estacion, volumen, duracion, motivo):
     conexion.close()
     return resumen
 
+def corregir_riego_bd(id_estacion, volumen, duracion, motivo):
+    # El último riego de la estación lo cerró la central sin datos del engine
+    # (AVERIA o DESCONEXION) y ahora llega el RIEGO_FIN real: se guardan sus datos.
+    # Devuelve True si había un riego que corregir.
+    conexion = sqlite3.connect(DB_PATH)
+    cursor = conexion.cursor()
+    cursor.execute("SELECT ID, Motivo FROM riegos WHERE Estacion = ? ORDER BY ID DESC", (id_estacion,))
+    fila = cursor.fetchone()
+    corregido = fila is not None and fila[1] in CIERRES_PROVISIONALES
+    if corregido:
+        cursor.execute("""
+            UPDATE riegos
+            SET Volumen = ?, Duracion = ?, Motivo = ?
+            WHERE ID = ?
+        """, (volumen, duracion, f"{fila[1]}/{motivo}", fila[0]))
+        conexion.commit()
+    conexion.close()
+    return corregido
+
+def operario_riego_abierto(id_estacion):
+    # Operario del riego que la BD tiene abierto en la estación (o None)
+    conexion = sqlite3.connect(DB_PATH)
+    cursor = conexion.cursor()
+    cursor.execute("SELECT Operario FROM riegos WHERE Estacion = ? AND Fin IS NULL ORDER BY ID DESC", (id_estacion,))
+    fila = cursor.fetchone()
+    conexion.close()
+    return fila[0] if fila else None
+
 ########## EVENTOS DE RIEGO QUE ENVÍA EL ENGINE POR KAFKA ##########
 # Las llama escuchar_eventos al recibir RIEGO_INICIO, TELEMETRIA y RIEGO_FIN de WM_WS_E.
 # Además de la BD actualizan el diccionario, que es lo que pinta el panel.
@@ -397,10 +435,14 @@ def riego_iniciado(id_estacion, id_operario, limite):
         if id_estacion not in estaciones:
             return
         estacion = estaciones[id_estacion]
-        estacion["estado"] = "WATERING"
+        # Si el monitor no está conectado (evento atrasado tras reiniciar la central)
+        # se guarda el riego pero la estación sigue Desconectada en el panel
+        if estacion["estado"] != "OFFLINE":
+            estacion["estado"] = "WATERING"
         estacion["flow"] = 0.0
         estacion["accum"] = 0.0
         estacion["operator"] = id_operario
+        estacion["inicio"] = time.time()
         bloqueada = estacion["bloqueada"]
         iniciar_riego_bd(id_estacion, id_operario, limite)
     log(f"[RIEGO] '{id_estacion}' empieza a regar. Operario: {id_operario}, límite {limite} s")
@@ -417,6 +459,13 @@ def telemetria_recibida(id_estacion, caudal, volumen):
         estacion = estaciones[id_estacion]
         estacion["flow"] = caudal
         estacion["accum"] = volumen
+        # El monitor se ha vuelto a registrar (AVAILABLE) mientras el engine seguía
+        # regando, o la central se reinició a mitad del riego: el estado real es WATERING
+        if estacion["estado"] == "AVAILABLE":
+            estacion["estado"] = "WATERING"
+            modificar_estado(id_estacion, "WATERING")
+        if not estacion.get("operator"):
+            estacion["operator"] = operario_riego_abierto(id_estacion)
         id_operario = estacion.get("operator")
     actualizar_telemetria_bd(id_estacion, caudal, volumen)
     # Cada operario solo recibe los datos de la estación que le está regando (punto 10)
@@ -429,6 +478,8 @@ def riego_finalizado(id_estacion, id_operario, volumen, duracion, motivo):
             return None
         estacion = estaciones[id_estacion]
         resumen = finalizar_riego_bd(id_estacion, volumen, duracion, motivo)
+        if resumen is None and corregir_riego_bd(id_estacion, volumen, duracion, motivo):
+            log(f"[RIEGO] '{id_estacion}': llega el fin real de un riego que la central había cerrado sin datos")
         estacion["flow"] = estacion["accum"] = estacion["operator"] = None
         # Vuelve a reposo salvo que la haya cambiado otro evento (fuga, bloqueo, desconexión)
         if estacion["estado"] == "WATERING":
@@ -438,6 +489,25 @@ def riego_finalizado(id_estacion, id_operario, volumen, duracion, motivo):
     # Resumen final para el operario que pidió el riego (punto 8)
     notificar_operario(id_operario, f"RESUMEN#{id_operario}#{id_estacion}#{volumen}#{duracion}#{motivo}")
     return resumen
+
+def riego_interrumpido(estacion, motivo):
+    # La estación deja de regar sin que lo haya dicho el engine (fuga o desconexión).
+    # Se llama con lock_estaciones cogido. Se limpia la telemetría del panel y se
+    # programa el cierre provisional por si el engine no llega a mandar su RIEGO_FIN.
+    inicio = estacion.get("inicio")
+    duracion = int(time.time() - inicio) if inicio else None    # hasta ahora, no hasta el cierre
+    datos = (estacion["id"], estacion.get("operator"), estacion.get("accum"), duracion, motivo)
+    estacion["flow"] = estacion["accum"] = estacion["operator"] = None
+    threading.Timer(ESPERA_RIEGO_FIN, cierre_provisional, args=datos).start()
+
+def cierre_provisional(id_estacion, id_operario, volumen, duracion, motivo):
+    resumen = finalizar_riego_bd(id_estacion, volumen, duracion, motivo)
+    if resumen is None:
+        return      # el RIEGO_FIN del engine ya ha cerrado el riego
+    volumen_txt = f"{volumen:.2f}" if volumen is not None else "-"
+    log(f"[RIEGO] '{id_estacion}' sin noticias del engine: riego cerrado por la central ({motivo}), {volumen_txt} l")
+    id_operario = id_operario or resumen["operario"]
+    notificar_operario(id_operario, f"RESUMEN#{id_operario}#{id_estacion}#{volumen_txt}#{duracion if duracion is not None else '-'}#{motivo}")
 
 ########## KAFKA ##########
 
@@ -481,45 +551,69 @@ def notificar_operario(id_operario, mensaje):
     if id_operario not in (OPERARIO_CENTRAL, OPERARIO_LOCAL):
         publicar(TOPIC_RESPUESTAS, id_operario, mensaje)
 
+def crear_consumidor(topic, bootstrap):
+    # Consumidor del grupo de la central (WM_Central_<topic>). Cada mensaje se
+    # confirma (commit) después de procesarlo: lo que se publique con la central
+    # caída se queda en Kafka y se procesa al volver, no se pierde ninguna transacción.
+    # "latest" solo se usa la primera vez que arranca el grupo.
+    return KafkaConsumer(topic, bootstrap_servers=bootstrap, group_id=f"WM_Central_{topic}",
+                         auto_offset_reset="latest", enable_auto_commit=False,
+                         session_timeout_ms=SESION_KAFKA_MS, heartbeat_interval_ms=SESION_KAFKA_MS // 3)
+
 def escuchar_eventos(bootstrap):
-    # Eventos de los engines. Sin group_id y con "latest": al reiniciar la central
-    # no se reprocesan eventos viejos (la mecánica ya cierra los riegos abiertos).
-    consumidor = KafkaConsumer(TOPIC_EVENTOS, bootstrap_servers=bootstrap,
-                               group_id=None, auto_offset_reset="latest")
+    # Eventos de los engines. Los que llegaron con la central caída (RIEGO_FIN de
+    # riegos que estaban en marcha) se procesan ahora y cierran el riego con los datos reales.
+    consumidor = crear_consumidor(TOPIC_EVENTOS, bootstrap)
     for registro in consumidor:
-        msg = registro.value.decode(FORMAT)
-        partes = msg.split('#')
-        try:
-            if partes[0] == "RIEGO_INICIO" and len(partes) == 4:
-                riego_iniciado(partes[1], partes[2], int(partes[3]))
-            elif partes[0] == "TELEMETRIA" and len(partes) == 4:
-                telemetria_recibida(partes[1], float(partes[2]), float(partes[3]))
-            elif partes[0] == "RIEGO_FIN" and len(partes) == 6:
-                riego_finalizado(partes[1], partes[2], float(partes[3]), int(partes[4]), partes[5])
-            elif partes[0] == "RECHAZADO" and len(partes) == 4:
-                id_estacion, id_operario, motivo = partes[1], partes[2], partes[3]
-                log(f"[RIEGO] '{id_estacion}' NO AUTORIZA el riego de {id_operario}: {motivo}")
-                notificar_operario(id_operario, f"DENEGADO#{id_operario}#{id_estacion}#la estación lo rechaza: {motivo}")
-            else:
-                log(f"[KAFKA] Evento no válido: {msg}")
-        except ValueError:
-            log(f"[KAFKA] Evento con datos no válidos: {msg}")
+        procesar_evento(registro)
+        consumidor.commit()
+
+def procesar_evento(registro):
+    msg = registro.value.decode(FORMAT)
+    partes = msg.split('#')
+    try:
+        if partes[0] == "RIEGO_INICIO" and len(partes) == 4:
+            riego_iniciado(partes[1], partes[2], int(partes[3]))
+        elif partes[0] == "TELEMETRIA" and len(partes) == 4:
+            telemetria_recibida(partes[1], float(partes[2]), float(partes[3]))
+        elif partes[0] == "RIEGO_FIN" and len(partes) == 6:
+            riego_finalizado(partes[1], partes[2], float(partes[3]), int(partes[4]), partes[5])
+        elif partes[0] == "RECHAZADO" and len(partes) == 4:
+            id_estacion, id_operario, motivo = partes[1], partes[2], partes[3]
+            log(f"[RIEGO] '{id_estacion}' NO AUTORIZA el riego de {id_operario}: {motivo}")
+            notificar_operario(id_operario, f"DENEGADO#{id_operario}#{id_estacion}#la estación lo rechaza: {motivo}")
+        else:
+            log(f"[KAFKA] Evento no válido: {msg}")
+    except ValueError:
+        log(f"[KAFKA] Evento con datos no válidos: {msg}")
 
 def escuchar_peticiones(bootstrap):
     # Peticiones de los operarios:
     #   SOLICITUD#id_operario#id_ws#limite_segundos -> RECIBIDA y luego AUTORIZADO o DENEGADO
     #   LISTA#id_operario                            -> LISTA#id_operario#WS_01=Disponible;...
-    consumidor = KafkaConsumer(TOPIC_PETICIONES, bootstrap_servers=bootstrap,
-                               group_id=None, auto_offset_reset="latest")
+    consumidor = crear_consumidor(TOPIC_PETICIONES, bootstrap)
+
+    # Las peticiones que ya estaban en el topic al arrancar se hicieron con la central
+    # caída: el FO ya mostró "Imposible conectar con WM_Central" y no espera ese riego.
+    # No se pierden: se contestan con DENEGADO para que el operario sepa qué pasó.
+    particiones = consumidor.partitions_for_topic(TOPIC_PETICIONES) or {0}
+    fin_atrasadas = consumidor.end_offsets([TopicPartition(TOPIC_PETICIONES, p) for p in particiones])
+
     for registro in consumidor:
         msg = registro.value.decode(FORMAT)
         partes = msg.split('#')
+        atrasada = registro.offset < fin_atrasadas.get(TopicPartition(registro.topic, registro.partition), 0)
         if partes[0] == "SOLICITUD" and len(partes) == 4 and partes[3].isdigit() and int(partes[3]) > 0:
-            atender_solicitud(partes[1], partes[2], int(partes[3]))
+            if atrasada:
+                log(f"[PETICIÓN] {partes[1]} pidió regar '{partes[2]}' con la central caída: se deniega")
+                notificar_operario(partes[1], f"DENEGADO#{partes[1]}#{partes[2]}#la central estaba caída cuando se pidió, hay que volver a pedirlo")
+            else:
+                atender_solicitud(partes[1], partes[2], int(partes[3]))
         elif partes[0] == "LISTA" and len(partes) == 2:
             notificar_operario(partes[1], f"LISTA#{partes[1]}#{lista_estaciones()}")
         else:
             log(f"[KAFKA] Petición no válida: {msg}")
+        consumidor.commit()
 
 def atender_solicitud(id_operario, id_estacion, limite):
     # Cada paso se notifica al operario y se muestra en el panel (punto 4)
@@ -661,27 +755,31 @@ def cambiar_estado_monitor(id_estacion, nuevo_estado):
         estado_anterior = estacion["estado"]
         estacion["estado"] = nuevo_estado
         modificar_estado(id_estacion, nuevo_estado)
+        if estado_anterior == "WATERING" and nuevo_estado == "LEAK":
+            riego_interrumpido(estacion, "AVERIA")
 
     if estado_anterior == "WATERING" and nuevo_estado == "LEAK":
-        log(f"[AVERÍA] Fuga en '{id_estacion}' durante un riego: el engine lo corta")
+        log(f"[AVERÍA] Fuga o engine caído en '{id_estacion}' durante un riego: se espera su RIEGO_FIN")
+    # Fuga resuelta en una estación bloqueada: el engine puede haberse reiniciado
+    # (se pierde el bloqueo que tenía en memoria), así que se le repite la orden
+    if estado_anterior == "LEAK" and nuevo_estado == "STOPPED":
+        enviar_orden(id_estacion, f"BLOQUEAR#{id_estacion}")
     return nuevo_estado
 
 def desconectar_estacion(id_estacion):
     with lock_estaciones:
         estacion = estaciones[id_estacion]
         estado_anterior = estacion["estado"]
-        id_operario = estacion.get("operator")
         estacion["estado"] = "OFFLINE"
         estacion["conn"] = None
         estacion["addr"] = None
-        estacion["flow"] = estacion["accum"] = estacion["operator"] = None
         modificar_estado(id_estacion, "OFFLINE")
-
-    # Si estaba regando, el riego queda cerrado: ya no se puede monitorizar
-    if estado_anterior == "WATERING":
-        finalizar_riego_bd(id_estacion, None, None, "DESCONEXION")
-        if id_operario:
-            notificar_operario(id_operario, f"RESUMEN#{id_operario}#{id_estacion}#-#-#DESCONEXION")
+        # Si estaba regando ya no se puede monitorizar: el engine, al perder el
+        # monitor, corta el riego y manda su RIEGO_FIN; si no llega, lo cierra la central
+        if estado_anterior == "WATERING":
+            riego_interrumpido(estacion, "DESCONEXION")
+        else:
+            estacion["flow"] = estacion["accum"] = estacion["operator"] = None
 
 def calcular_lrc(datos):
     # XOR byte a byte del mensaje
