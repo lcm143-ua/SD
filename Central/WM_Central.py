@@ -1263,6 +1263,13 @@ def Pantalla_Monitor():
         except Exception:
             pass
 
+    def color_parpadeo(estado):
+        # El riego parpadea: el panel se refresca cada 500 ms y en medio segundo de
+        # cada segundo se pinta con el color apagado
+        if estado == "WATERING" and int(time.time() * 2) % 2:
+            return "WATERING_OFF"
+        return estado
+
     def redibujar_mapa():
         canvas_mapa.delete("all")
         if mapa_img_tk:
@@ -1271,7 +1278,7 @@ def Pantalla_Monitor():
         with lock_estaciones:
             for id_est, data in estaciones.items():
                 sec = data.get("sector")
-                est = data.get("estado", "OFFLINE")
+                est = color_parpadeo(data.get("estado", "OFFLINE"))
                 if sec:
                     cx, cy = sec
                     bg_col = COLOR_ESTADO.get(est, "#eceff1")
@@ -1312,7 +1319,7 @@ def Pantalla_Monitor():
             ac = f"{e.get('accum'):.2f} L" if e.get('accum') is not None else "-"
             op = e.get('operator') or "-"
             st = e["estado"]
-            tabla.insert("", tk.END, values=(e["id"], e["ubicacion"], sec_str, TEXTO_ESTADO.get(st, st), fl, ac, op), tags=(st,))
+            tabla.insert("", tk.END, values=(e["id"], e["ubicacion"], sec_str, TEXTO_ESTADO.get(st, st), fl, ac, op), tags=(color_parpadeo(st),))
             if st != "OFFLINE":
                 ids_conectados.append(e["id"])
 
