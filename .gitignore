@@ -1,0 +1,5 @@
+# Generados al ejecutar
+__pycache__/
+*.pyc
+database.db
+riego_*.json
