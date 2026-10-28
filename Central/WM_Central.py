@@ -100,6 +100,17 @@ OPERARIOS_INICIALES = [
     ("FO_03", "Operario 3")
 ]
 
+# Estaciones dadas de alta al crear la BD. Solo se pueden autenticar las WS que
+# estén dadas de alta; las demás se rechazan con "WS no registrada". Las nuevas
+# se dan de alta desde el panel (Tkinter o web) con su ID y su ubicación.
+ESTACIONES_INICIALES = [
+    ("WS_01", "Bosque_Dioses"),
+    ("WS_02", "Patio_Armas"),
+    ("WS_03", "Cripta"),
+    ("WS_04", "Establos"),
+    ("WS_05", "Septo")
+]
+
 conexion = sqlite3.connect(DB_PATH)
 cursor = conexion.cursor()
 
@@ -144,6 +155,7 @@ cursor.execute("""
 """)
 
 cursor.executemany("INSERT OR IGNORE INTO operarios (ID, Nombre) VALUES (?, ?)", OPERARIOS_INICIALES)
+cursor.executemany("INSERT OR IGNORE INTO estaciones (ID, Location, Status) VALUES (?, ?, 'OFFLINE')", ESTACIONES_INICIALES)
 
 #Guardar
 conexion.commit()
@@ -719,17 +731,50 @@ def aplicar_orden(id_estacion, funcion, *args):
 
 ########## SOCKETS ##########
 
-def registrar_estacion(id_estacion, ubicacion, conn, addr, sector_idx=None):
-    # Autenticación: se rechaza un ID que ya tiene un monitor conectado.
-    # Comprobar y dar de alta va dentro del lock para que dos monitores con el
-    # mismo ID que lleguen a la vez no puedan pasar los dos.
+def dar_alta_estacion(id_estacion, ubicacion):
+    # Alta de una WS nueva (desde el panel). Es independiente de la autenticación:
+    # dar de alta solo la guarda en la BD; se conectará cuando arranque su monitor.
+    # Devuelve (True, "") o (False, motivo).
+    id_estacion = id_estacion.strip()
+    if not id_estacion or '#' in id_estacion or ' ' in id_estacion:
+        return False, "el ID no puede estar vacío ni tener espacios o '#'"
+    if ubicacion not in ZONAS_SECTORES:
+        return False, f"ubicación desconocida '{ubicacion}'"
     with lock_estaciones:
-        if id_estacion in estaciones and estaciones[id_estacion]["conn"] is not None:
-            return False
+        if id_estacion in estaciones:
+            return False, f"'{id_estacion}' ya está dada de alta ({estaciones[id_estacion]['ubicacion']})"
+        estaciones[id_estacion] = {
+            "id": id_estacion,
+            "ubicacion": ubicacion,
+            "sector": None,
+            "estado": "OFFLINE",
+            "bloqueada": False,
+            "addr": None,
+            "conn": None
+        }
+        guardar_estacion_bd(estaciones, id_estacion)
+    log(f"[ALTA] Estación '{id_estacion}' dada de alta en {ubicacion}")
+    return True, ""
+
+def registrar_estacion(id_estacion, ubicacion, conn, addr, sector_idx=None):
+    # Autenticación del monitor. Devuelve (True, "") o (False, motivo). Se rechaza:
+    #   - un ID que no está dado de alta en la BD (WS no registrada)
+    #   - una ubicación distinta de la que tiene dada de alta
+    #   - un ID que ya tiene un monitor conectado
+    #   - una ubicación sin sectores libres
+    # Todo va dentro del lock para que dos monitores con el mismo ID que lleguen
+    # a la vez no puedan pasar los dos.
+    with lock_estaciones:
+        if id_estacion not in estaciones:
+            return False, "WS no registrada"
+        if estaciones[id_estacion]["ubicacion"] != ubicacion:
+            return False, f"la WS está dada de alta en {estaciones[id_estacion]['ubicacion']}, no en {ubicacion}"
+        if estaciones[id_estacion]["conn"] is not None:
+            return False, "la WS ya está conectada"
 
         sec = asignar_sector(id_estacion, ubicacion, sector_idx)
         if sec is None:
-            return False
+            return False, f"no quedan sectores libres en {ubicacion}"
 
         # Si la central la había bloqueado, sigue bloqueada al reconectarse
         bloqueada = id_estacion in estaciones and estaciones[id_estacion]["bloqueada"]
@@ -743,7 +788,7 @@ def registrar_estacion(id_estacion, ubicacion, conn, addr, sector_idx=None):
             "conn": conn
         }
         guardar_estacion_bd(estaciones, id_estacion)
-    return True
+    return True, ""
 
 def cambiar_estado_monitor(id_estacion, nuevo_estado):
     # Aplica un ESTADO enviado por el monitor. Devuelve el estado con que queda.
@@ -893,7 +938,8 @@ def atender_mensaje(conn, addr, msg, id_estacion_actual):
         ubicacion = partes[2]
         sector_idx = int(partes[3]) if len(partes) > 3 and partes[3].isdigit() else None
 
-        if registrar_estacion(id_estacion, ubicacion, conn, addr, sector_idx):
+        ok, motivo = registrar_estacion(id_estacion, ubicacion, conn, addr, sector_idx)
+        if ok:
             log(f"[REGISTRO OK] Estación '{id_estacion}' ({ubicacion}) registrada desde {addr}")
             send_msg(conn, f"ACK#REGISTER_OK#{id_estacion}")
             mostrar_bd()
@@ -902,8 +948,8 @@ def atender_mensaje(conn, addr, msg, id_estacion_actual):
                 enviar_orden(id_estacion, f"BLOQUEAR#{id_estacion}")
             return id_estacion, True
 
-        log(f"[REGISTRO KO] '{id_estacion}' ya está conectada o sector ocupado, se rechaza {addr}")
-        send_msg(conn, f"NACK#REGISTER_KO#{id_estacion}#ID o Sector no disponible")
+        log(f"[REGISTRO KO] '{id_estacion}' desde {addr} rechazada: {motivo}")
+        send_msg(conn, f"NACK#REGISTER_KO#{id_estacion}#{motivo}")
         return None, False
 
     # Autenticación: hasta registrarse solo se acepta REGISTER
@@ -1029,7 +1075,7 @@ def tipo_log(linea):
         return "error"
     if any(p in texto for p in ("[BLOQUEO]", "[DESCONEXION]", "[LATIDO]", "OFFLINE")):
         return "aviso"
-    if any(p in texto for p in ("[RIEGO]", "[ACTIVAR]", "REGISTRO OK")):
+    if any(p in texto for p in ("[RIEGO]", "[ACTIVAR]", "[ALTA]", "REGISTRO OK")):
         return "ok"
     if any(p in texto for p in ("[ORDEN", "[ESTADO]")):
         return "info"
@@ -1224,6 +1270,25 @@ def Pantalla_Monitor():
     btn_activar = ttk.Button(f_ctrl, text="ACTIVAR", style="Activar.TButton", command=cmd_activar)
     btn_activar.grid(row=0, column=6, padx=5)
 
+    # Alta de una WS nueva: solo las dadas de alta se pueden autenticar
+    tk.Label(f_ctrl, text="Alta WS:", font=(FUENTE, 9, "bold"), bg=C_TARJETA).grid(row=1, column=0, sticky="w", padx=(0, 5), pady=(10, 0))
+    entry_alta = ttk.Entry(f_ctrl, width=12)
+    entry_alta.grid(row=1, column=1, sticky="w", padx=(0, 15), pady=(10, 0))
+    tk.Label(f_ctrl, text="Ubicación:", font=(FUENTE, 9, "bold"), bg=C_TARJETA).grid(row=1, column=2, sticky="w", padx=(0, 5), pady=(10, 0))
+    combo_ubicacion = ttk.Combobox(f_ctrl, values=list(ZONAS_SECTORES), state="readonly", width=14)
+    combo_ubicacion.set(next(iter(ZONAS_SECTORES)))
+    combo_ubicacion.grid(row=1, column=3, columnspan=2, sticky="w", padx=(0, 15), pady=(10, 0))
+
+    def cmd_alta():
+        ok, motivo = dar_alta_estacion(entry_alta.get(), combo_ubicacion.get())
+        if ok:
+            entry_alta.delete(0, tk.END)
+        else:
+            log(f"[ALTA] ERROR: {motivo}")
+
+    btn_alta = ttk.Button(f_ctrl, text="DAR DE ALTA", style="Activar.TButton", command=cmd_alta)
+    btn_alta.grid(row=1, column=5, columnspan=2, sticky="w", padx=5, pady=(10, 0))
+
     borde_log, tarjeta_log = crear_tarjeta(frame_izq, "Registro de eventos")
     borde_log.grid(row=2, column=0, sticky="nsew")
 
@@ -1393,7 +1458,11 @@ PAGINA_WEB = """<!doctype html>
       <label>Límite (s) <input id="limite" type="number" min="1" value="60"></label>
       <button class="regar" onclick="orden('REGAR')">REGAR</button>
       <button class="bloquear" onclick="orden('BLOQUEAR')">BLOQUEAR</button>
-      <button class="activar" onclick="orden('ACTIVAR')">ACTIVAR</button></div></div>
+      <button class="activar" onclick="orden('ACTIVAR')">ACTIVAR</button></div>
+      <div class="controles" style="margin-top:10px">
+      <label>Alta WS <input id="alta_id" placeholder="WS_06"></label>
+      <label>Ubicación <select id="alta_ubicacion"></select></label>
+      <button class="activar" onclick="alta()">DAR DE ALTA</button></div></div>
     <div class="tarjeta"><h2>REGISTRO DE EVENTOS</h2><pre id="log"></pre></div>
   </div>
   <div class="columna"><div class="tarjeta"><h2>MAPA DE SECTORES</h2><div id="mapa"></div></div></div>
@@ -1408,7 +1477,7 @@ function tipoLog(l) {
   const t = l.toUpperCase();
   if (["KO]", "AVERÍA", "FUGA", "ERROR", "DENEG", "NO SE PUEDE", "NO AUTORIZ"].some(p => t.includes(p))) return "error";
   if (["[BLOQUEO]", "[DESCONEXION]", "[LATIDO]", "OFFLINE"].some(p => t.includes(p))) return "aviso";
-  if (["[RIEGO]", "[ACTIVAR]", "REGISTRO OK"].some(p => t.includes(p))) return "ok";
+  if (["[RIEGO]", "[ACTIVAR]", "[ALTA]", "REGISTRO OK"].some(p => t.includes(p))) return "ok";
   if (["[ORDEN", "[ESTADO]", "[KAFKA]", "[PETICIÓN]"].some(p => t.includes(p))) return "info";
   return "";
 }
@@ -1418,6 +1487,8 @@ async function refrescar() {
   try {
     const d = await (await fetch("/api/estado")).json();
     document.getElementById("estado").textContent = "● En servicio · sockets " + d.puerto + (d.kafka ? " · Kafka OK" : " · Kafka sin conexión");
+    const ubic = document.getElementById("alta_ubicacion");
+    if (!ubic.length) d.ubicaciones.forEach(u => ubic.add(new Option(u)));
     const cuenta = {TOTAL: d.estaciones.length};
     d.estaciones.forEach(e => cuenta[e.estado] = (cuenta[e.estado] || 0) + 1);
     document.getElementById("kpis").innerHTML = KPIS.map(([k, t, c]) =>
@@ -1461,6 +1532,15 @@ async function orden(accion) {
   refrescar();
 }
 
+async function alta() {
+  // El resultado (o el error) aparece en el registro de eventos
+  await fetch("/api/alta", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({estacion: document.getElementById("alta_id").value,
+                          ubicacion: document.getElementById("alta_ubicacion").value})});
+  document.getElementById("alta_id").value = "";
+  refrescar();
+}
+
 refrescar();
 setInterval(refrescar, 1000);
 </script>
@@ -1493,7 +1573,8 @@ class PanelWeb(BaseHTTPRequestHandler):
                     "estado": e["estado"], "texto": TEXTO_ESTADO.get(e["estado"], e["estado"]),
                     "flow": e.get("flow"), "accum": e.get("accum"), "operator": e.get("operator")
                 } for e in sorted(estaciones.values(), key=lambda e: e["id"])]
-            datos = {"puerto": PORT, "kafka": productor is not None, "estaciones": lista, "log": list(historial_log)}
+            datos = {"puerto": PORT, "kafka": productor is not None, "estaciones": lista,
+                     "ubicaciones": list(ZONAS_SECTORES), "log": list(historial_log)}
             self.responder(200, "application/json", json.dumps(datos).encode(FORMAT))
         elif self.path == "/mapa" and buscar_mapa():
             ruta = buscar_mapa()
@@ -1504,6 +1585,16 @@ class PanelWeb(BaseHTTPRequestHandler):
             self.responder(404, "text/plain", b"No encontrado")
 
     def do_POST(self):
+        if self.path == "/api/alta":
+            try:
+                datos = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                ok, motivo = dar_alta_estacion(str(datos["estacion"]), str(datos["ubicacion"]))
+            except (ValueError, KeyError, TypeError) as e:
+                ok, motivo = False, f"petición no válida: {e}"
+            if not ok:
+                log(f"[ALTA] ERROR: {motivo}")
+            self.responder(200 if ok else 400, "application/json", json.dumps({"ok": ok, "error": motivo}).encode(FORMAT))
+            return
         if self.path != "/api/orden":
             self.responder(404, "text/plain", b"No encontrado")
             return
