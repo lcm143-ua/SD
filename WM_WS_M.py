@@ -54,7 +54,7 @@ saliendo = threading.Event()
 
 ########## PROTOCOLO <STX><DATA><ETX><LRC> ##########
 
-def calcular_lrc(datos):
+def calcular_lrc(datos): #LRC
     # XOR byte a byte del mensaje
     lrc = 0
     for byte in datos:
@@ -62,7 +62,7 @@ def calcular_lrc(datos):
     return lrc
 
 
-def empaquetar(msg):
+def empaquetar(msg): #Convierte un mensaje de texto en una trama lista para enviar por el socket.
     datos = msg.encode(FORMAT)
     if STX in datos or ETX in datos:
         raise ValueError("el mensaje no puede contener los caracteres STX/ETX")
@@ -401,6 +401,10 @@ def main():
                 print(f"[RESPUESTA CENTRAL]: {respuesta}")
 
     server.close()
+
+
+def conectar_registry():
+    pass    # pendiente: alta y baja en WM_Registry
 
 
 print("****** WELCOME TO OUR BRILLIANT SD UA CURSO 2026/2027 SOCKET CLIENT ****")
