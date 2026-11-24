@@ -1,3 +1,10 @@
+------------------------------------------------------------------------
+>>>>>>>>>>>>>> Prioridades, por orden de impacto en la nota <<<<<<<<<<<<
+------------------------------------------------------------------------
+
+-> Dos monitores que serán operadores, y mi pc que será la central con el 
+despliegue de kafka
+
 **** DESPLIEGUE, MODULARIDAD Y ESCALABILIDAD ****
 - La estructura del repo no es la que piden. 
 La guía exige las carpetas WM_Central/, WM_WS/, WM_FO/ y prompts/, 
@@ -117,3 +124,4 @@ en mitad de un riego.
 Que el engine guarde el riego en curso en disco y envíe el resultado al reiniciarse.
 
 Timeout en el FO (y aviso en el engine) que muestre "Imposible conectar con WM_Central".
+
